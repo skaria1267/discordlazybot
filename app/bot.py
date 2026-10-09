@@ -564,12 +564,9 @@ class LazyBot(discord.Client):
             location = f"服务器「{target.guild.name}」的 #{getattr(channel, 'name', cid)} 频道"
             system = await context.build_system(cfg, general, gid, location, user_ids, emoji_text, sticker_text)
 
-        if interject:
-            system += "\n\n这次没有人直接叫你，是你自己决定加入聊天，自然地接话即可。"
-        elif not is_dm:
-            system += f"\n\n这次需要你回应的是 {await context.user_tag(gid, str(target.author.id))} 的最新消息。"
-
+        target_tag = "" if is_dm else await context.user_tag(gid, str(target.author.id))
         messages = await context.build_messages(rows, gid, cfg, general)
+        context.append_note(messages, context.request_note(general, target_tag, interject))
         async with channel.typing():
             text = await llm.call("chat", system, messages, guild_id=None if is_dm else gid,
                                   provider_id=cfg.get("chat_provider") or "", model=cfg.get("chat_model") or "")

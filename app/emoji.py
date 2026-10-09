@@ -86,6 +86,8 @@ async def candidates(guild_id: str, limit: int) -> tuple[str, dict]:
         "WHERE e.kind='emoji' AND e.available=1 "
         "ORDER BY cnt DESC, (e.guild_id=?) DESC, (e.description IS NOT NULL) DESC, e.name LIMIT ?",
         (guild_id, guild_id, max(0, limit)))
+    # 选出哪些表情按常用程度，列出来的顺序按表情 ID 固定，避免使用次数变化打乱顺序、破坏提示词缓存
+    rows.sort(key=lambda r: int(r["id"]))
     mapping, lines = {}, []
     for i, r in enumerate(rows, 1):
         code = f"e{i}"
@@ -98,7 +100,7 @@ async def candidates(guild_id: str, limit: int) -> tuple[str, dict]:
 async def sticker_candidates(guild_id: str, limit: int = 20) -> tuple[str, dict]:
     rows = await db.fetchall(
         "SELECT id, name, description FROM emojis WHERE kind='sticker' AND available=1 AND guild_id=? "
-        "ORDER BY name LIMIT ?", (guild_id, limit))
+        "ORDER BY CAST(id AS INTEGER) LIMIT ?", (guild_id, limit))
     mapping, lines = {}, []
     for i, r in enumerate(rows, 1):
         code = f"s{i}"

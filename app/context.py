@@ -260,7 +260,8 @@ async def memory_block(guild_id: str, user_ids: list[str], dm_user: str | None =
     if row and row["content"].strip():
         parts.append("【服务器记忆】\n" + row["content"].strip())
     user_lines = []
-    for uid in user_ids:
+    # 按用户 ID 固定排序，避免谁最近说话导致顺序变化、破坏提示词缓存
+    for uid in sorted(set(user_ids), key=lambda x: int(x) if str(x).isdigit() else 0):
         r = await db.fetchone("SELECT content FROM memories WHERE scope='user' AND guild_id=? AND user_id=?",
                               (guild_id, uid))
         if r and r["content"].strip():
@@ -289,10 +290,8 @@ def format_rules(has_emojis: bool, has_stickers: bool, max_reactions: int) -> st
 async def build_system(cfg: dict, general: dict, guild_id: str, location: str, user_ids: list[str],
                        emoji_text: str, sticker_text: str, dm_user: str | None = None,
                        dm_mode: str | None = None) -> str:
-    zone = tz(general["timezone"])
-    now = dt.datetime.now(zone).strftime("%Y-%m-%d %H:%M %A")
+    # 系统提示词里只放稳定的内容；当前时间等每次都变的信息由 request_note() 放到最后一条消息末尾
     sections = [cfg.get("persona") or ""]
-    sections.append(f"【当前时间】{now}（{general['timezone']}）")
     sections.append(f"【当前位置】{location}")
     sections.append("【身份说明】聊天记录里每位群友以 [服务器昵称-用户名-用户ID] 标识，用户ID 唯一不变，"
                     "昵称可能会变。多条连续的群友消息会合并在一起，你自己说过的话是 assistant 消息。")
@@ -307,6 +306,27 @@ async def build_system(cfg: dict, general: dict, guild_id: str, location: str, u
         sections.append("【可用贴纸】（代码 | 描述）\n" + sticker_text)
     sections.append(format_rules(bool(emoji_text), bool(sticker_text), int(general.get("max_reactions") or 0)))
     return "\n\n".join(s for s in sections if s)
+
+
+def request_note(general: dict, target_tag: str = "", interject: bool = False) -> str:
+    """每次请求都会变的信息（当前时间、这次回应谁），放在最后一条用户消息末尾，不影响前面的缓存。"""
+    zone = tz(general["timezone"])
+    now = dt.datetime.now(zone)
+    week = "一二三四五六日"[now.weekday()]
+    parts = [f"现在是 {now.strftime('%Y-%m-%d %H:%M')} 星期{week}（{general['timezone']}）。"]
+    if interject:
+        parts.append("这次没有人直接叫你，是你自己决定加入聊天，自然地接话即可。")
+    elif target_tag:
+        parts.append(f"这次需要你回应的是 {target_tag} 的最新消息。")
+    return "（系统提示：" + "".join(parts) + "）"
+
+
+def append_note(messages: list[dict], note: str) -> list[dict]:
+    if messages and messages[-1]["role"] == "user":
+        messages[-1]["parts"].append({"type": "text", "text": "\n" + note})
+    else:
+        messages.append({"role": "user", "parts": [{"type": "text", "text": note}]})
+    return messages
 
 
 def parse_output(text: str) -> dict:

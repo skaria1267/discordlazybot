@@ -693,6 +693,9 @@ async def preview(guild_id: str = "", channel_id: str = ""):
                 else "（预览：未指定服务器）")
     system = await context.build_system(cfg, general, guild_id, location, user_ids[:20], emoji_text, sticker_text)
     msgs = await context.build_messages(rows, guild_id, {**cfg, "image_limit": 0}, general)
+    last_user = next((r for r in reversed(rows) if not r["is_self"]), None)
+    target = await context.user_tag(guild_id, last_user["author_id"]) if last_user and guild_id else ""
+    context.append_note(msgs, context.request_note(general, target))
     transcript = []
     for m in msgs:
         text = "".join(p.get("text", "") for p in m["parts"] if p["type"] == "text").strip()
