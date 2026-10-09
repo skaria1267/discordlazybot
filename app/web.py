@@ -214,7 +214,7 @@ async def members(gid: str, q: str = ""):
 async def import_channel(cid: str, body: dict = Body(default={})):
     client = manager.client
     if client is None or not client.is_ready():
-        raise HTTPException(400, "bot 未在线")
+        raise HTTPException(400, "bot 不在线，先到「设置 › 机器人连接」连上 Discord")
     limit = max(1, min(int(body.get("limit") or 500), 20000))
     job = memory.new_job("import")
 
@@ -227,6 +227,38 @@ async def import_channel(cid: str, body: dict = Body(default={})):
 
     asyncio.create_task(runner())
     return {"job_id": job["id"]}
+
+
+_guild_imports: dict[str, str] = {}
+
+
+@app.post("/api/guilds/{gid}/import", dependencies=A)
+async def import_guild(gid: str, body: dict = Body(default={})):
+    client = manager.client
+    if client is None or not client.is_ready():
+        raise HTTPException(400, "bot 不在线，先到「设置 › 机器人连接」连上 Discord")
+    running = _guild_imports.get(gid)
+    if running and memory.jobs.get(running, {}).get("status") == "running":
+        return {"job_id": running}
+    limit = max(1, min(int(body.get("limit") or 2000), 50000))
+    job = memory.new_job("import_guild")
+    _guild_imports[gid] = job["id"]
+
+    async def runner():
+        try:
+            await client.import_guild(int(gid), limit, job)
+            job["status"] = "done"
+        except Exception as e:  # noqa: BLE001
+            job["status"], job["error"] = "error", str(e)
+
+    asyncio.create_task(runner())
+    return {"job_id": job["id"]}
+
+
+@app.get("/api/guilds/{gid}/import", dependencies=A)
+async def import_guild_status(gid: str):
+    jid = _guild_imports.get(gid)
+    return memory.jobs.get(jid) if jid else None
 
 
 @app.get("/api/jobs/{jid}", dependencies=A)

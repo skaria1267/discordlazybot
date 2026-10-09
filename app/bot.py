@@ -196,16 +196,68 @@ class LazyBot(discord.Client):
         ch = self.get_channel(channel_id)
         if ch is None or not hasattr(ch, "history"):
             raise ValueError("找不到这个频道，或 bot 没有权限")
-        first = await db.fetchone("SELECT MIN(CAST(id AS INTEGER)) AS first FROM messages WHERE channel_id=?",
-                                  (str(channel_id),))
-        before = discord.Object(id=int(first["first"])) if first and first["first"] else None
         job["total"] = limit
+
+        def tick(n):
+            job["progress"] = n
+
+        n = await self._import_channel(ch, limit, tick)
+        job["result"] = f"导入了 {n} 条消息" if n else "没有更早的消息了"
+
+    async def _import_channel(self, ch, limit: int, on_progress=None) -> int:
+        """从已存的最早一条消息往前拉取，返回导入条数。"""
+        first = await db.fetchone("SELECT MIN(CAST(id AS INTEGER)) AS first FROM messages WHERE channel_id=?",
+                                  (str(ch.id),))
+        before = discord.Object(id=int(first["first"])) if first and first["first"] else None
         n = 0
         async for m in ch.history(limit=limit, before=before):
             await self.store_message(m)
             n += 1
-            job["progress"] = n
-        job["result"] = f"导入了 {n} 条消息"
+            if on_progress and n % 20 == 0:
+                on_progress(n)
+        if on_progress:
+            on_progress(n)
+        return n
+
+    def importable_channels(self, guild: discord.Guild) -> list:
+        """bot 能读取历史的文字频道、语音频道的文字区和活跃子区。"""
+        me = guild.me
+        out = []
+        candidates = [c for c in guild.channels if isinstance(c, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel))]
+        candidates += list(guild.threads)
+        for c in candidates:
+            perms = c.permissions_for(me) if me else None
+            if perms and perms.view_channel and perms.read_message_history:
+                out.append(c)
+        return out
+
+    async def import_guild(self, guild_id: int, limit: int, job: dict) -> None:
+        guild = self.get_guild(guild_id)
+        if guild is None:
+            raise ValueError("bot 不在这个服务器里")
+        channels = self.importable_channels(guild)
+        if not channels:
+            raise ValueError("没有 bot 能读取历史的频道，检查一下「阅读消息历史记录」权限")
+        job.update(total=len(channels), progress=0, imported=0, channel="", skipped=[])
+        log.info("开始导入服务器「%s」的历史，%d 个频道，每个最多 %d 条", guild.name, len(channels), limit)
+        for i, ch in enumerate(channels, 1):
+            job["progress"] = i
+            job["channel"] = ch.name
+            base = job["imported"]
+
+            def tick(n, base=base):
+                job["imported"] = base + n
+
+            try:
+                await self._import_channel(ch, limit, tick)
+            except discord.Forbidden:
+                job["skipped"].append(ch.name)
+            except Exception as e:  # noqa: BLE001
+                job["skipped"].append(ch.name)
+                log.warning("导入 #%s 失败：%s", ch.name, e)
+        skipped = f"，跳过 {len(job['skipped'])} 个没权限的频道" if job["skipped"] else ""
+        job["result"] = f"从 {len(channels)} 个频道导入了 {job['imported']} 条消息{skipped}"
+        log.info("服务器「%s」%s", guild.name, job["result"])
 
     # ---------- 消息存储 ----------
 

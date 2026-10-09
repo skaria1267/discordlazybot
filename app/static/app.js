@@ -608,7 +608,8 @@ async function memoryCard(card, scope, gid, uid, title) {
   const m = info.memory;
   card.innerHTML = `<div class="sheet-head"><h3 class="tape green">${title}</h3></div>
     ${m && m.content.trim() ? `<div class="clamp">${esc(m.content)}</div>` : '<p class="muted" style="margin:0">还没有记忆。可以从聊天记录里总结一份，也可以直接手写。</p>'}
-    <p class="hint">${m ? `${ago(m.updated_at)}更新 · ` : ''}${info.summarized_until ? `上次总结到 ${fmtTime(info.summarized_until)}，之后新增 ${info.new_since} 条消息` : `共有 ${info.new_since} 条消息可以总结`}</p>
+    <p class="hint">${m ? `${ago(m.updated_at)}更新 · ` : ''}${info.summarized_until ? `上次总结到 ${fmtTime(info.summarized_until)}，之后新增 ${info.new_since} 条消息` : `共有 ${info.new_since} 条消息可以总结`}
+    ${gid !== 'dm' ? ` · <a href="#/server/${gid}/channels">消息不全？导入历史</a>` : ''}</p>
     <div class="actions"><button class="btn" data-a="edit">${icon('pen')}${m ? '编辑' : '手写'}</button><button class="btn ink" data-a="sum">${icon('spark')}总结</button></div>`;
   const refresh = () => memoryCard(card, scope, gid, uid, title);
   card.querySelector('[data-a=edit]').onclick = () => openMemorySheet(scope, gid, uid, title, refresh);
@@ -675,9 +676,19 @@ function openSummarize(scope, gid, uid, info, title, onDone) {
     });
     body.append(field('总结哪段时间的消息', rangeChips));
     if (st.range === 'custom') {
-      const row = h(`<div class="row"><div class="grow"><span class="lab">从</span><input type="datetime-local" data-k="start"></div><div class="grow"><span class="lab">到</span><input type="datetime-local" data-k="end"></div></div>`);
-      $$('input', row).forEach((inp) => { inp.onchange = () => { st[inp.dataset.k] = inp.value ? new Date(inp.value).getTime() / 1000 : null; count(); }; });
-      body.append(h('<div class="field"></div>')).append(row);
+      if (st.start == null && st.end == null) { st.start = Math.floor(now - 7 * 86400); st.end = Math.floor(now); }
+      const toLocal = (ts) => {
+        if (!ts) return '';
+        const d = new Date(ts * 1000);
+        const p = (n) => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+      };
+      const wrap = h(`<div class="field"><div class="row">
+        <div class="grow"><span class="lab">从</span><input type="datetime-local" data-k="start" value="${toLocal(st.start)}"></div>
+        <div class="grow"><span class="lab">到</span><input type="datetime-local" data-k="end" value="${toLocal(st.end)}"></div></div>
+        <div class="help">留空表示不限制</div></div>`);
+      $$('input', wrap).forEach((inp) => { inp.onchange = () => { st[inp.dataset.k] = inp.value ? new Date(inp.value).getTime() / 1000 : null; count(); }; });
+      body.append(wrap);
     }
     if (g && g.channels.length) {
       const chips = h('<div class="chips"></div>');
@@ -703,7 +714,8 @@ function openSummarize(scope, gid, uid, info, title, onDone) {
       try {
         const r = await api('/api/memory/count', payload());
         const el = $('.cnt', body);
-        if (el) el.innerHTML = `将读取 <span class="mark">${r.total}</span> 条消息${r.user !== undefined ? `，其中 TA 说了 ${r.user} 条` : ''}。`;
+        if (el) el.innerHTML = `将读取 <span class="mark">${r.total}</span> 条消息${r.user !== undefined ? `，其中 TA 说了 ${r.user} 条` : ''}。`
+          + (gid !== 'dm' ? `<br>只能总结 bot 已经存下来的消息，更早的聊天记录要先到「频道」页导入。` : '');
         foot.disabled = !r.total;
       } catch (e) { const el = $('.cnt', body); if (el) el.textContent = e.message; }
     }, 250);
@@ -842,9 +854,59 @@ async function openMember(g, m, onChange) {
 }
 
 /* ---------- 频道 ---------- */
+async function importGuildCard(g, onDone) {
+  const card = h(`<div class="sheet"><h3 class="tape blue">导入整个服务器的历史</h3>
+    <p class="small muted" style="margin-top:0">bot 只会自动保存它进群之后的消息。这里会把每个频道更早的聊天记录拉下来，用来总结记忆。可以重复点，每次都接着往前拉，不会重复。</p>
+    <div class="row wrap"><span class="small">每个频道最多</span><input type="number" min="1" value="2000" style="width:96px"><span class="small grow">条</span>
+    <button class="btn ink">${icon('download')}开始导入</button></div>
+    <div class="prog" hidden style="margin-top:12px"><div class="progress"><i></i></div><p class="hint txt"></p></div></div>`);
+  const btn = card.querySelector('.btn');
+  const prog = card.querySelector('.prog');
+  const show = (j) => {
+    if (!j) return;
+    prog.hidden = false;
+    const pct = j.total ? Math.round(((j.status === 'running' ? j.progress - 0.5 : j.progress) / j.total) * 100) : 0;
+    prog.querySelector('i').style.width = `${Math.max(3, pct)}%`;
+    const txt = prog.querySelector('.txt');
+    if (j.status === 'running') {
+      txt.innerHTML = `正在导入 #${esc(j.channel || '…')}（${j.progress}/${j.total}），已导入 <span class="mark">${fmtNum(j.imported)}</span> 条`;
+      btn.disabled = true;
+    } else if (j.status === 'done') {
+      txt.innerHTML = `${esc(j.result)}${j.skipped && j.skipped.length ? `：${j.skipped.map((s) => '#' + esc(s)).join('、')}` : ''}`;
+      btn.disabled = false;
+    } else {
+      txt.textContent = `导入失败：${j.error}`;
+      btn.disabled = false;
+    }
+  };
+  let timer;
+  const poll = (jid) => {
+    clearInterval(timer);
+    timer = setInterval(async () => {
+      try {
+        const j = await api(`/api/jobs/${jid}`);
+        show(j);
+        if (j.status !== 'running') { clearInterval(timer); if (j.status === 'done') { toast(j.result); if (onDone) onDone(); } }
+      } catch (e) { clearInterval(timer); }
+    }, 1500);
+    state.timers.push(timer);
+  };
+  btn.onclick = () => run(btn, async () => {
+    const { job_id } = await api(`/api/guilds/${g.id}/import`, { limit: +card.querySelector('input').value || 2000 });
+    show({ status: 'running', progress: 0, total: 0, imported: 0 });
+    poll(job_id);
+  });
+  try {
+    const cur = await api(`/api/guilds/${g.id}/import`);
+    if (cur) { show(cur); if (cur.status === 'running') poll(cur.id); }
+  } catch (_) { /* 忽略 */ }
+  return card;
+}
+
 async function serverChannels(body, g) {
   const overrides = await api(`/api/config/channels?guild_id=${g.id}`);
   body.innerHTML = '';
+  if (g.joined) body.append(await importGuildCard(g, () => loadGuilds()));
   const card = h(`<div class="sheet"><p class="hint" style="margin-top:0">点开频道可以单独设置人设、上下文和插话；右侧开关控制 bot 是否在这个频道工作。</p><div class="list"></div></div>`);
   body.append(card);
   const list = card.querySelector('.list');
