@@ -461,6 +461,16 @@ async function configEditor(box, scopeType, scopeId, opts = {}) {
       const body = card.querySelector('.section-body');
       const dis = !custom;
       SECTION_RENDER[sec.id](body, { val, set: (k, v) => form.set(k, v), dis, providers, opts, redraw: draw });
+      if (sec.id === 'reply' && !isGlobal && opts.guildId) {
+        // 上下文起点立即生效，不受「跟随上层」影响，所以放在分区内容之外
+        const g = state.guilds.find((x) => x.id === opts.guildId);
+        card.append(h('<hr class="hr">'));
+        card.append(contextStartBlock({
+          guildId: opts.guildId,
+          channelId: scopeType === 'channel' ? scopeId : '',
+          channels: g ? g.channels.filter((c) => c.type !== 'category') : [],
+        }));
+      }
       box.append(card);
     }
   }
@@ -866,25 +876,45 @@ function startBadge(s) {
   return s ? `<span class="badge yellow">上下文从 ${fmtTime(s.start_ts)} 起</span>` : '';
 }
 
-function contextStartCard(guildId, channelId, current, onChange) {
-  const card = h('<div class="sheet"><h3 class="tape yellow">上下文从哪开始</h3><div class="now"></div><div class="ctl"></div></div>');
-  let cur = current;
+/**
+ * 上下文起点设置块（立即生效）。
+ * channelId 固定时只管这个频道；否则可以选「所有频道」或某个频道（channels 为频道列表）。
+ */
+function contextStartBlock({ guildId, channelId = '', channels = [], onChange }) {
+  const el = h('<div class="ctx-block"><div class="row" style="margin-bottom:6px"><span class="grow" style="font-size:16px">上下文起点</span><span class="badge">立即生效</span></div><div class="now"></div><div class="ctl"></div></div>');
+  let starts = {};
+  let target = channelId || 'all';
   let mode = 'now';
   let ts = Math.floor(Date.now() / 1000 - 3600);
   let msg = '';
+  const chName = (id) => { const c = channels.find((x) => x.id === id); return c ? `#${c.name}` : '某个频道'; };
+
   const drawNow = () => {
-    const box = card.querySelector('.now');
-    if (!cur) {
-      box.innerHTML = '<p class="small muted" style="margin-top:0">现在是默认：每次回复带上最近若干条消息（条数在人设配置里设置）。</p>';
-    } else {
-      box.innerHTML = `<p class="small" style="margin-top:0">现在 bot 只看 <span class="mark">${fmtTime(cur.start_ts)}</span> 之后的消息，目前有 ${cur.after} 条。</p>
-        ${cur.first ? `<div class="turn"><b>起点后的第一条 · ${esc(cur.first.who)}</b>${esc(cur.first.text) || '（无文字）'}</div>` : ''}`;
+    const box = $('.now', el);
+    if (channelId) {
+      const cur = starts[channelId];
+      box.innerHTML = cur
+        ? `<p class="small" style="margin:0 0 8px">bot 只看 <span class="mark">${fmtTime(cur.start_ts)}</span> 之后的消息，目前有 ${cur.after} 条。</p>
+           ${cur.first ? `<div class="turn"><b>起点后的第一条 · ${esc(cur.first.who)}</b>${esc(cur.first.text) || '（无文字）'}</div>` : ''}`
+        : '<p class="small muted" style="margin:0 0 8px">没有设置起点：每次回复带上最近若干条消息（上面的条数）。</p>';
+      return;
     }
+    const ids = Object.keys(starts);
+    box.innerHTML = ids.length
+      ? `<p class="small" style="margin:0 0 4px">已设置起点的频道：</p><ul class="ledger" style="margin-bottom:8px">${ids.map((id) => `<li><span class="k">${esc(chName(id))}</span><span class="dots"></span><span class="v small">${fmtTime(starts[id].start_ts)} 起 · ${starts[id].after} 条</span></li>`).join('')}</ul>`
+      : '<p class="small muted" style="margin:0 0 8px">还没有频道设置起点：每次回复都带上最近若干条消息。改完人设想让 bot 忘掉之前聊的，可以在这里设置。</p>';
   };
+
   const drawCtl = () => {
-    const box = card.querySelector('.ctl');
+    const box = $('.ctl', el);
     box.innerHTML = '';
-    box.append(field('设置新的起点', seg([['now', '从现在'], ['time', '按时间'], ['message', '按消息']], mode, (v) => { mode = v; drawCtl(); })));
+    if (!channelId) {
+      const sel = h(`<select><option value="all">所有频道</option>${channels.map((c) => `<option value="${c.id}" ${c.id === target ? 'selected' : ''}>#${esc(c.name)}</option>`).join('')}</select>`);
+      sel.value = target;
+      sel.onchange = () => { target = sel.value; drawCtl(); };
+      box.append(field('作用于', sel));
+    }
+    box.append(field('从哪开始', seg([['now', '从现在'], ['time', '按时间'], ['message', '按消息']], mode, (v) => { mode = v; drawCtl(); })));
     if (mode === 'now') {
       box.append(h('<p class="hint" style="margin-top:-6px">之前的消息都不再带进上下文，相当于让 bot 忘掉刚才聊的。</p>'));
     } else if (mode === 'time') {
@@ -892,29 +922,57 @@ function contextStartCard(guildId, channelId, current, onChange) {
       inp.onchange = () => { ts = inp.value ? new Date(inp.value).getTime() / 1000 : null; };
       box.append(field('从这个时间开始', inp));
     } else {
-      const inp = textInput(msg, (v) => { msg = v; }, { placeholder: '消息 ID 或消息链接' });
-      box.append(field('从这条消息开始（包含它）', inp, '手机上长按消息 → 复制消息链接；电脑上右键消息 → 复制消息 ID（需打开开发者模式）。'));
+      const inp = textInput(msg, (v) => { msg = v; }, { placeholder: target === 'all' ? '粘贴消息链接' : '消息链接或消息 ID' });
+      box.append(field('从这条消息开始（包含它）', inp,
+        target === 'all' ? '会自动识别链接属于哪个频道，只设置那个频道。手机上长按消息 → 复制消息链接。'
+          : '手机上长按消息 → 复制消息链接。用链接更保险，复制错频道会提示。'));
     }
     const actions = h('<div class="actions"></div>');
-    if (cur) {
-      const reset = h('<button class="btn ghost">恢复默认</button>');
+    const hasCur = target === 'all' ? Object.keys(starts).length > 0 : !!starts[target];
+    if (hasCur) {
+      const reset = h(`<button class="btn ghost">${target === 'all' ? '全部恢复默认' : '恢复默认'}</button>`);
       reset.onclick = () => run(reset, async () => {
-        const r = await api('/api/context/clear', { guild_id: guildId, channel_ids: [channelId] });
-        cur = r.starts[channelId] || null; drawNow(); drawCtl(); if (onChange) onChange(r.starts);
+        const r = await api('/api/context/clear', target === 'all' ? { guild_id: guildId, all: true } : { guild_id: guildId, channel_ids: [target] });
+        starts = r.starts; drawNow(); drawCtl(); if (onChange) onChange(starts);
       }, '已恢复默认');
       actions.append(reset);
     }
     const set = h(`<button class="btn ink">${icon('check')}设置起点</button>`);
     set.onclick = () => run(set, async () => {
-      const r = await api('/api/context/start', { guild_id: guildId, channel_ids: [channelId], mode, ts, message: msg });
-      cur = r.starts[channelId] || null; drawNow(); drawCtl(); if (onChange) onChange(r.starts);
-      toast(`已设置，bot 之后只看 ${fmtTime(r.start_ts)} 起的消息`);
+      let body;
+      if (target === 'all' && mode === 'message') {
+        const m = msg.match(/channels\/(\d+|@me)\/(\d+)\/(\d+)/);
+        if (!m) throw new Error('作用于所有频道时，请粘贴消息链接（链接里带着频道），或先选择具体频道');
+        body = { guild_id: guildId, channel_ids: [m[2]], mode, message: msg };
+      } else if (target === 'all') {
+        if (mode === 'now' && !confirm('让所有频道都从现在开始，之前的消息不再带进上下文？')) return;
+        body = { guild_id: guildId, all: true, mode, ts };
+      } else {
+        body = { guild_id: guildId, channel_ids: [target], mode, ts, message: msg };
+      }
+      const r = await api('/api/context/start', body);
+      starts = r.starts; drawNow(); drawCtl(); if (onChange) onChange(starts);
+      const scope = body.all ? '所有频道' : chName(body.channel_ids[0]);
+      toast(`${scope}：bot 之后只看 ${fmtTime(r.start_ts)} 起的消息`);
     });
     actions.append(set);
     box.append(actions);
   };
+
+  (async () => {
+    try { starts = (await api(`/api/context/starts?guild_id=${guildId}`)).starts; } catch (_) { starts = {}; }
+    if (channelId) { const only = starts[channelId]; starts = only ? { [channelId]: only } : {}; }
+    drawNow();
+    drawCtl();
+  })();
   drawNow();
   drawCtl();
+  return el;
+}
+
+function contextStartCard(guildId, channelId, current, onChange) {
+  const card = h('<div class="sheet"></div>');
+  card.append(contextStartBlock({ guildId, channelId, onChange }));
   return card;
 }
 
@@ -967,32 +1025,11 @@ async function importGuildCard(g, onDone) {
   return card;
 }
 
-function allContextCard(g, starts, onChange) {
-  const n = Object.keys(starts).length;
-  const card = h(`<div class="sheet"><h3 class="tape yellow">所有频道的上下文</h3>
-    <p class="small muted" style="margin-top:0">${n ? `有 ${n} 个频道设置了上下文起点。` : '让 bot 在所有频道都忘掉之前聊的，比如刚改完人设的时候。'}单个频道可以点开后按时间或消息设置。记忆不受影响。</p>
-    <div class="actions" style="justify-content:flex-start"></div></div>`);
-  const actions = card.querySelector('.actions');
-  const now = h(`<button class="btn">${icon('refresh')}全部从现在开始</button>`);
-  now.onclick = () => {
-    if (!confirm('让 bot 在这个服务器的所有频道都从现在开始，之前的消息不再带进上下文？')) return;
-    run(now, async () => { await api('/api/context/start', { guild_id: g.id, all: true, mode: 'now' }); onChange(); }, '已设置，所有频道从现在开始');
-  };
-  actions.append(now);
-  if (n) {
-    const reset = h('<button class="btn ghost">全部恢复默认</button>');
-    reset.onclick = () => run(reset, async () => { await api('/api/context/clear', { guild_id: g.id, all: true }); onChange(); }, '已全部恢复默认');
-    actions.append(reset);
-  }
-  return card;
-}
-
 async function serverChannels(body, g) {
   const overrides = await api(`/api/config/channels?guild_id=${g.id}`);
   const { starts } = await api(`/api/context/starts?guild_id=${g.id}`);
   body.innerHTML = '';
   if (g.joined) body.append(await importGuildCard(g, () => loadGuilds()));
-  body.append(allContextCard(g, starts, () => serverChannels(body, g)));
   const card = h(`<div class="sheet"><p class="hint" style="margin-top:0">点开频道可以单独设置人设、上下文起点和插话；右侧开关控制 bot 是否在这个频道工作。</p><div class="list"></div></div>`);
   body.append(card);
   const list = card.querySelector('.list');
@@ -1021,7 +1058,6 @@ async function openChannel(g, c, start, onChange) {
   const save = h('<button class="btn ink" disabled>保存</button>');
   let form;
   const sheet = openSheet({ title: `#${esc(c.name)}`, body, foot: [save], beforeClose: () => !form || !form.count() || confirmLeave(), onClose: onChange });
-  body.append(contextStartCard(g.id, c.id, start || null));
   const cfgBox = h('<div></div>');
   body.append(cfgBox);
   form = await configEditor(cfgBox, 'channel', c.id, {
