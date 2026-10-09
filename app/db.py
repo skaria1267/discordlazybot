@@ -65,6 +65,10 @@ async def init() -> None:
     await _conn.execute("PRAGMA synchronous=NORMAL")
     await _conn.executescript(SCHEMA)
     await _conn.commit()
+    # 迁移：记忆增加「已总结到」时间点
+    cols = [r["name"] for r in await fetchall("PRAGMA table_info(memories)")]
+    if "summarized_until" not in cols:
+        await execute("ALTER TABLE memories ADD COLUMN summarized_until REAL")
 
 
 async def close() -> None:

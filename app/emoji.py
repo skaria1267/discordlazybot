@@ -145,11 +145,20 @@ async def tag_one(row: dict) -> str:
               + f"请用一句中文描述它的画面和适合在什么情绪或场合下使用，不超过 40 字。只输出这一句话。")
     text = await llm.call("tagging", "", [{"role": "user", "parts": [
         {"type": "image", "media_type": "image/png", "data": base64.b64encode(png).decode()},
-        {"type": "text", "text": prompt}]}], guild_id=row["guild_id"], max_tokens=200)
-    return text.strip().strip("「」\"'")[:120]
+        {"type": "text", "text": prompt}]}], guild_id=row["guild_id"])
+    desc = text.strip().strip("「」\"'").strip()
+    if not desc:
+        raise ValueError("模型返回了空内容")
+    return desc[:200]
 
 
 async def tagger_loop() -> None:
+    # 旧版本可能保存了空描述，重新排队打标
+    try:
+        await db.execute("UPDATE emojis SET description=NULL, fail=0 WHERE TRIM(COALESCE(description,''))='' "
+                         "AND description IS NOT NULL AND desc_manual=0")
+    except Exception:  # noqa: BLE001
+        log.exception("重置空描述失败")
     while True:
         await asyncio.sleep(20)
         try:

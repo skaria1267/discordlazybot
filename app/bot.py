@@ -457,7 +457,7 @@ class LazyBot(discord.Client):
                   "大多数时候应该 IGNORE；只有话题和你有关、很有趣、或你确实能接上话时才 SPEAK。")
         try:
             out = await llm.call("judge", system, [{"role": "user", "parts": [{"type": "text", "text": prompt}]}],
-                                 guild_id=gid, max_tokens=30)
+                                 guild_id=gid)
         except Exception as e:  # noqa: BLE001
             log.warning("插话判断失败：%s", e)
             return "IGNORE", "", {}

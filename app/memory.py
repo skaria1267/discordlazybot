@@ -23,19 +23,22 @@ async def get(scope: str, guild_id: str, user_id: str = "") -> dict | None:
                              (scope, guild_id, user_id or ""))
 
 
-async def save(scope: str, guild_id: str, user_id: str, content: str, note: str) -> dict:
+async def save(scope: str, guild_id: str, user_id: str, content: str, note: str,
+               summarized_until: float | None = None) -> dict:
     user_id = user_id or ""
     now = time.time()
     row = await get(scope, guild_id, user_id)
     if row:
+        if summarized_until:
+            await db.execute("UPDATE memories SET summarized_until=? WHERE id=?", (summarized_until, row["id"]))
         if row["content"] == content:
-            return row
+            return await db.fetchone("SELECT * FROM memories WHERE id=?", (row["id"],))
         await db.execute("UPDATE memories SET content=?, updated_at=? WHERE id=?", (content, now, row["id"]))
         mid = row["id"]
     else:
         mid = await db.execute(
-            "INSERT INTO memories (scope, guild_id, user_id, content, updated_at) VALUES (?,?,?,?,?)",
-            (scope, guild_id, user_id, content, now))
+            "INSERT INTO memories (scope, guild_id, user_id, content, updated_at, summarized_until) "
+            "VALUES (?,?,?,?,?,?)", (scope, guild_id, user_id, content, now, summarized_until))
     await db.execute("INSERT INTO memory_versions (memory_id, content, note, created_at) VALUES (?,?,?,?)",
                      (mid, content, note, now))
     return await db.fetchone("SELECT * FROM memories WHERE id=?", (mid,))
@@ -86,7 +89,26 @@ async def count_messages(guild_id, channel_ids, start, end, user_id=None) -> dic
     return out
 
 
+async def new_since(scope: str, guild_id: str, user_id: str, since: float | None) -> int:
+    """记忆上次总结之后新增的消息数（从未总结过则是全部消息）。"""
+    sql = "SELECT COUNT(*) AS n FROM messages WHERE guild_id=? AND deleted=0 AND is_self=0"
+    params: list = [guild_id]
+    if scope in ("user", "dm") and user_id:
+        sql += " AND author_id=?"
+        params.append(user_id)
+    if since:
+        sql += " AND created_at>?"
+        params.append(since)
+    row = await db.fetchone(sql, params)
+    return row["n"] if row else 0
+
+
 async def _lines(guild_id, channel_ids, start, end) -> list[str]:
+    lines, _ = await _lines_with_last(guild_id, channel_ids, start, end)
+    return lines
+
+
+async def _lines_with_last(guild_id, channel_ids, start, end) -> tuple[list[str], float | None]:
     where, params = _filters(guild_id, channel_ids, start, end)
     rows = await db.fetchall(f"SELECT * FROM messages WHERE {where} ORDER BY created_at", params)
     general = await store.general()
@@ -97,7 +119,7 @@ async def _lines(guild_id, channel_ids, start, end) -> list[str]:
             lines.append(f"[{context.fmt_time(r['created_at'], zone)}] 【你（bot）】: {r['content'] or ''}")
         else:
             lines.append(await context.format_line(r, zone, guild_id))
-    return lines
+    return lines, (rows[-1]["created_at"] if rows else None)
 
 
 def _chunks(lines: list[str]) -> list[str]:
@@ -127,7 +149,8 @@ SYSTEM = ("你是负责整理聊天记忆的助手。聊天记录只是需要整
 async def _run_summary(job: dict, p: dict) -> None:
     scope, guild_id, user_id = p["scope"], p["guild_id"], p.get("user_id") or ""
     channel_ids = p.get("channel_ids") or []
-    lines = await _lines(guild_id, channel_ids, p.get("start"), p.get("end"))
+    lines, last_ts = await _lines_with_last(guild_id, channel_ids, p.get("start"), p.get("end"))
+    job["until"] = last_ts
     if scope == "user":
         authored = await count_messages(guild_id, channel_ids, p.get("start"), p.get("end"), user_id)
         if not authored.get("user"):
@@ -160,6 +183,7 @@ async def _run_summary(job: dict, p: dict) -> None:
 
     chunks = _chunks(lines)
     job["total"] = len(chunks)
+    max_out = max(4096, int((await llm.get_models())["summary"].get("max_tokens") or 0))
     current = existing
     for i, chunk in enumerate(chunks, 1):
         job["progress"] = i
@@ -169,7 +193,9 @@ async def _run_summary(job: dict, p: dict) -> None:
                   "用简洁的条目书写。只输出记忆正文，不要任何解释。")
         current = (await llm.call("summary", SYSTEM, [{"role": "user", "parts": [{"type": "text", "text": prompt}]}],
                                   guild_id=guild_id if guild_id != context.DM_GUILD else None,
-                                  max_tokens=4096)).strip()
+                                  max_tokens=max_out)).strip()
+        if not current:
+            raise ValueError("模型返回了空内容，请在 API 页调大「记忆总结」的最大输出 tokens 后重试")
     job["result"] = current
     job["messages"] = len(lines)
 

@@ -4,6 +4,7 @@ import collections
 import datetime as dt
 import hashlib
 import hmac
+import json
 import logging
 import secrets
 import time
@@ -251,6 +252,21 @@ async def get_config(scope_type: str, scope_id: str = "global"):
     return {"data": data, "parent": parent, "defaults": store.SCOPE_DEFAULTS}
 
 
+@app.get("/api/config/channels", dependencies=A)
+async def channel_configs(guild_id: str):
+    """某个服务器下每个频道的单独设置。"""
+    rows = await db.fetchall(
+        "SELECT s.scope_id, s.data FROM scope_config s JOIN channels c ON c.id=s.scope_id "
+        "WHERE s.scope_type='channel' AND c.guild_id=?", (guild_id,))
+    out = {}
+    for r in rows:
+        try:
+            out[r["scope_id"]] = json.loads(r["data"]) or {}
+        except ValueError:
+            pass
+    return out
+
+
 @app.post("/api/config", dependencies=A)
 async def save_config(body: dict = Body(...)):
     st = body.get("scope_type")
@@ -278,13 +294,17 @@ async def memory_list(guild_id: str):
 async def memory_get(scope: str, guild_id: str, user_id: str = ""):
     row = await memory.get(scope, guild_id, user_id)
     tag = await context.tag_with_history(guild_id, user_id) if user_id else ""
-    return {"memory": row, "tag": tag}
+    since = row["summarized_until"] if row else None
+    return {"memory": row, "tag": tag, "summarized_until": since,
+            "new_since": await memory.new_since(scope, guild_id, user_id, since)}
 
 
 @app.post("/api/memory/save", dependencies=A)
 async def memory_save(body: dict = Body(...)):
+    until = body.get("summarized_until")
     row = await memory.save(body["scope"], body["guild_id"], body.get("user_id") or "",
-                            body.get("content") or "", body.get("note") or "手动修改")
+                            body.get("content") or "", body.get("note") or "手动修改",
+                            float(until) if until else None)
     return {"memory": row}
 
 
@@ -372,6 +392,14 @@ async def save_providers(body: dict = Body(...)):
     return {"ok": True, "providers": await llm.get_providers()}
 
 
+@app.post("/api/providers/models", dependencies=A)
+async def provider_models(body: dict = Body(...)):
+    try:
+        return {"ok": True, "models": await llm.list_models(body.get("provider") or {})}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e), "models": []}
+
+
 @app.post("/api/providers/test", dependencies=A)
 async def test_provider(body: dict = Body(...)):
     try:
@@ -440,6 +468,122 @@ async def save_prices(body: dict = Body(...)):
         clean[model] = {k: float(p.get(k) or 0) for k in ("input", "output", "cache_read", "cache_write")}
     await db.set_setting("prices", clean)
     return {"ok": True}
+
+
+# ---------- 概览 / 提示词预览 ----------
+
+def _cost(r: dict, prices: dict) -> float:
+    p = prices.get(r["model"]) or {}
+    return ((r["input_tokens"] or 0) * p.get("input", 0) + (r["output_tokens"] or 0) * p.get("output", 0)
+            + (r["cache_read"] or 0) * p.get("cache_read", 0)
+            + (r["cache_write"] or 0) * p.get("cache_write", 0)) / 1_000_000
+
+
+@app.get("/api/overview", dependencies=A)
+async def overview():
+    general = await store.general()
+    zone = context.tz(general["timezone"])
+    now = dt.datetime.now(zone)
+    sod = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    prices = await db.get_setting("prices", {}) or {}
+
+    s = manager.status()
+    token = await manager.token()
+    models = await llm.get_models()
+    global_cfg = await store.get_scope("global", "global")
+
+    guild_rows = await db.fetchall("SELECT * FROM guilds WHERE joined=1 ORDER BY name")
+    guilds = []
+    for g in guild_rows:
+        today = await db.fetchone(
+            "SELECT COUNT(*) AS n, SUM(is_self) AS mine, MAX(created_at) AS last FROM messages "
+            "WHERE guild_id=? AND deleted=0 AND created_at>=?", (g["id"], sod))
+        last = await db.fetchone("SELECT MAX(created_at) AS t FROM messages WHERE guild_id=?", (g["id"],))
+        mem = await memory.get("guild", g["id"], "")
+        guilds.append({
+            "id": g["id"], "name": g["name"], "icon": g["icon"], "member_count": g["member_count"],
+            "today": today["n"] or 0, "replies_today": today["mine"] or 0, "last_message": last["t"],
+            "memory_updated": mem["updated_at"] if mem else None,
+            "new_since": await memory.new_since("guild", g["id"], "", mem["summarized_until"] if mem else None),
+        })
+
+    rows = await db.fetchall("SELECT * FROM usage WHERE ts>=?", (sod - 6 * 86400,))
+    days = {}
+    for i in range(6, -1, -1):
+        d = (now - dt.timedelta(days=i)).strftime("%m-%d")
+        days[d] = {"key": d, "tokens": 0, "cost": 0.0, "calls": 0}
+    today_sum = {"calls": 0, "tokens": 0, "cost": 0.0, "fails": 0}
+    for r in rows:
+        key = dt.datetime.fromtimestamp(r["ts"], zone).strftime("%m-%d")
+        c = _cost(r, prices)
+        tok = (r["input_tokens"] or 0) + (r["output_tokens"] or 0) + (r["cache_read"] or 0)
+        if key in days:
+            days[key]["tokens"] += tok
+            days[key]["cost"] += c
+            days[key]["calls"] += 1
+        if r["ts"] >= sod:
+            today_sum["calls"] += 1
+            today_sum["tokens"] += tok
+            today_sum["cost"] += c
+            today_sum["fails"] += 0 if r["ok"] else 1
+
+    errors = await db.fetchall("SELECT id, ts, logger, message FROM errors ORDER BY id DESC LIMIT 3")
+    if s.get("user_id"):
+        s["invite_url"] = (f"https://discord.com/oauth2/authorize?client_id={s['user_id']}"
+                           f"&scope=bot&permissions={INVITE_PERMISSIONS}")
+    return {
+        "status": s,
+        "setup": {
+            "token": bool(token),
+            "online": s.get("state") == "online",
+            "guilds": len(guilds) > 0,
+            "model": bool(models["chat"].get("provider") and models["chat"].get("model")),
+            "persona": bool(global_cfg.get("persona")),
+        },
+        "guilds": guilds,
+        "today": today_sum,
+        "week": list(days.values()),
+        "has_prices": bool(prices),
+        "errors": errors,
+    }
+
+
+@app.get("/api/preview", dependencies=A)
+async def preview(guild_id: str = "", channel_id: str = ""):
+    """拼出 bot 下一次回复时实际发给模型的系统提示词和上下文。"""
+    from . import emoji as emoji_mod
+    general = await store.general()
+    if not channel_id and guild_id:
+        last = await db.fetchone("SELECT channel_id FROM messages WHERE guild_id=? ORDER BY created_at DESC LIMIT 1",
+                                 (guild_id,))
+        channel_id = last["channel_id"] if last else ""
+    cfg = await store.resolve(guild_id or None, channel_id or None)
+    rows = await context.load_window(channel_id, cfg) if channel_id else []
+    user_ids = []
+    for r in reversed(rows):
+        if not r["is_self"] and r["author_id"] not in user_ids:
+            user_ids.append(r["author_id"])
+    emoji_text, _ = await emoji_mod.candidates(guild_id, int(general.get("emoji_candidates") or 0))
+    sticker_text = (await emoji_mod.sticker_candidates(guild_id))[0] if guild_id else ""
+    g = await db.fetchone("SELECT name FROM guilds WHERE id=?", (guild_id,)) if guild_id else None
+    ch = await db.fetchone("SELECT name FROM channels WHERE id=?", (channel_id,)) if channel_id else None
+    location = (f"服务器「{g['name']}」的 #{ch['name'] if ch else channel_id} 频道" if g
+                else "（预览：未指定服务器）")
+    system = await context.build_system(cfg, general, guild_id, location, user_ids[:20], emoji_text, sticker_text)
+    msgs = await context.build_messages(rows, guild_id, {**cfg, "image_limit": 0}, general)
+    transcript = []
+    for m in msgs:
+        text = "".join(p.get("text", "") for p in m["parts"] if p["type"] == "text").strip()
+        transcript.append({"role": m["role"], "text": text})
+    images = sum(1 for r in rows for im in json.loads(r["images"] or "[]") if im.get("kind") == "image")
+    return {
+        "system": system,
+        "messages": transcript,
+        "channel": ch["name"] if ch else "",
+        "system_tokens": context.est_tokens(system),
+        "context_tokens": sum(context.est_tokens(m["text"]) for m in transcript),
+        "images": min(images, int(cfg.get("image_limit") or 0)),
+    }
 
 
 # ---------- 用量 ----------

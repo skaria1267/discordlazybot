@@ -189,6 +189,7 @@ async def _request(provider: dict, model: str, system: str, messages: list[dict]
     usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     if fmt == "claude":
         text = "".join(c.get("text", "") for c in data.get("content", []) if c.get("type") == "text")
+        stop = data.get("stop_reason") or ""
         u = data.get("usage") or {}
         usage["input"] = int(u.get("input_tokens") or 0)
         usage["output"] = int(u.get("output_tokens") or 0)
@@ -202,12 +203,19 @@ async def _request(provider: dict, model: str, system: str, messages: list[dict]
         if isinstance(content, list):
             content = "".join(c.get("text", "") for c in content if isinstance(c, dict))
         text = content
+        stop = choices[0].get("finish_reason") or ""
         u = data.get("usage") or {}
-        usage["input"] = int(u.get("prompt_tokens") or 0)
-        usage["output"] = int(u.get("completion_tokens") or 0)
         details = u.get("prompt_tokens_details") or {}
         usage["cache_read"] = int(details.get("cached_tokens") or u.get("cache_read_input_tokens") or 0)
         usage["cache_write"] = int(u.get("cache_creation_input_tokens") or 0)
+        # OpenAI 格式的 prompt_tokens 已包含缓存命中部分，扣掉以免重复计费
+        usage["input"] = max(0, int(u.get("prompt_tokens") or 0) - usage["cache_read"])
+        usage["output"] = int(u.get("completion_tokens") or 0)
+    if stop in ("max_tokens", "length"):
+        log.warning("模型 %s 的输出因达到最大 tokens 被截断%s，请在 API 页调大「最大输出 tokens」"
+                    "（开启思考时思考内容也占用这个额度）", model, "，正文为空" if not text.strip() else "")
+    elif not text.strip():
+        log.warning("模型 %s 返回了空内容（stop_reason=%s）", model, stop or "?")
     return text, usage
 
 
@@ -263,11 +271,41 @@ async def call(purpose: str, system: str, messages: list[dict], guild_id: str | 
     raise LLMError(str(last_err) if last_err else "调用失败")
 
 
-async def test_provider(provider: dict, model: str) -> str:
-    if not provider.get("api_key") and provider.get("id"):
+async def _with_saved_key(provider: dict) -> dict:
+    """前端没有重新填 Key 时，使用已保存的 Key。"""
+    if provider.get("id"):
         saved = {p["id"]: p for p in await get_providers(with_keys=True)}
         if provider["id"] in saved:
             provider = {**saved[provider["id"]], **{k: v for k, v in provider.items() if v}}
+    return provider
+
+
+async def test_provider(provider: dict, model: str) -> str:
+    provider = await _with_saved_key(provider)
     text, usage = await _request(provider, model, "", [
-        {"role": "user", "parts": [{"type": "text", "text": "请只回复：OK"}]}], 16, 0)
-    return f"{text.strip()[:100]}（输入 {usage['input']} / 输出 {usage['output']} tokens）"
+        {"role": "user", "parts": [{"type": "text", "text": "请只回复：OK"}]}], 1024, 0)
+    return f"{text.strip()[:100] or '（空回复）'}（输入 {usage['input']} / 输出 {usage['output']} tokens）"
+
+
+async def list_models(provider: dict) -> list[str]:
+    """从供应商拉取可用模型列表（OpenAI 与 Claude 都是 GET /v1/models）。"""
+    provider = await _with_saved_key(provider)
+    fmt = provider.get("format", "openai")
+    base = (provider.get("base_url") or "").rstrip("/")
+    for suffix in ("/chat/completions", "/messages"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    url = base + "/models" if base.endswith("/v1") else base + "/v1/models"
+    key = provider.get("api_key", "")
+    headers = {"Authorization": f"Bearer {key}"}
+    if fmt == "claude":
+        headers.update({"x-api-key": key, "anthropic-version": "2023-06-01"})
+    resp = await client().get(url, headers=headers, params={"limit": 1000} if fmt == "claude" else None)
+    if resp.status_code >= 400:
+        raise LLMError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    items = data.get("data") if isinstance(data, dict) else data
+    ids = sorted({str(m.get("id")) for m in items or [] if isinstance(m, dict) and m.get("id")})
+    if not ids:
+        raise LLMError("供应商没有返回模型列表")
+    return ids

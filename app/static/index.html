@@ -3,19 +3,20 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#16181d">
+<meta name="theme-color" content="#e9ece3" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1c2028" media="(prefers-color-scheme: dark)">
 <title>LazyBot 后台</title>
-<link rel="stylesheet" href="/static/style.css?v=1">
+<link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
-<header id="top" hidden>
-  <div class="bar">
-    <div class="brand"><span class="dot" id="statusDot"></span>LazyBot</div>
-  </div>
-  <nav id="tabs"></nav>
-</header>
 <main id="main"></main>
+<nav id="nav" hidden></nav>
+<div id="savebar" hidden>
+  <div class="grow" id="savebarText">有改动还没保存</div>
+  <button class="btn sm" id="savebarDiscard">放弃</button>
+  <button class="btn sm ink" id="savebarSave">保存</button>
+</div>
 <div id="toast"></div>
-<script src="/static/app.js?v=1"></script>
+<script src="/static/app.js?v=2"></script>
 </body>
 </html>
