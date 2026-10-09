@@ -854,6 +854,70 @@ async function openMember(g, m, onChange) {
 }
 
 /* ---------- 频道 ---------- */
+/* ---------- 上下文起点 ---------- */
+function toLocalInput(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function startBadge(s) {
+  return s ? `<span class="badge yellow">上下文从 ${fmtTime(s.start_ts)} 起</span>` : '';
+}
+
+function contextStartCard(guildId, channelId, current, onChange) {
+  const card = h('<div class="sheet"><h3 class="tape yellow">上下文从哪开始</h3><div class="now"></div><div class="ctl"></div></div>');
+  let cur = current;
+  let mode = 'now';
+  let ts = Math.floor(Date.now() / 1000 - 3600);
+  let msg = '';
+  const drawNow = () => {
+    const box = card.querySelector('.now');
+    if (!cur) {
+      box.innerHTML = '<p class="small muted" style="margin-top:0">现在是默认：每次回复带上最近若干条消息（条数在人设配置里设置）。</p>';
+    } else {
+      box.innerHTML = `<p class="small" style="margin-top:0">现在 bot 只看 <span class="mark">${fmtTime(cur.start_ts)}</span> 之后的消息，目前有 ${cur.after} 条。</p>
+        ${cur.first ? `<div class="turn"><b>起点后的第一条 · ${esc(cur.first.who)}</b>${esc(cur.first.text) || '（无文字）'}</div>` : ''}`;
+    }
+  };
+  const drawCtl = () => {
+    const box = card.querySelector('.ctl');
+    box.innerHTML = '';
+    box.append(field('设置新的起点', seg([['now', '从现在'], ['time', '按时间'], ['message', '按消息']], mode, (v) => { mode = v; drawCtl(); })));
+    if (mode === 'now') {
+      box.append(h('<p class="hint" style="margin-top:-6px">之前的消息都不再带进上下文，相当于让 bot 忘掉刚才聊的。</p>'));
+    } else if (mode === 'time') {
+      const inp = h(`<input type="datetime-local" value="${toLocalInput(ts)}">`);
+      inp.onchange = () => { ts = inp.value ? new Date(inp.value).getTime() / 1000 : null; };
+      box.append(field('从这个时间开始', inp));
+    } else {
+      const inp = textInput(msg, (v) => { msg = v; }, { placeholder: '消息 ID 或消息链接' });
+      box.append(field('从这条消息开始（包含它）', inp, '手机上长按消息 → 复制消息链接；电脑上右键消息 → 复制消息 ID（需打开开发者模式）。'));
+    }
+    const actions = h('<div class="actions"></div>');
+    if (cur) {
+      const reset = h('<button class="btn ghost">恢复默认</button>');
+      reset.onclick = () => run(reset, async () => {
+        const r = await api('/api/context/clear', { guild_id: guildId, channel_ids: [channelId] });
+        cur = r.starts[channelId] || null; drawNow(); drawCtl(); if (onChange) onChange(r.starts);
+      }, '已恢复默认');
+      actions.append(reset);
+    }
+    const set = h(`<button class="btn ink">${icon('check')}设置起点</button>`);
+    set.onclick = () => run(set, async () => {
+      const r = await api('/api/context/start', { guild_id: guildId, channel_ids: [channelId], mode, ts, message: msg });
+      cur = r.starts[channelId] || null; drawNow(); drawCtl(); if (onChange) onChange(r.starts);
+      toast(`已设置，bot 之后只看 ${fmtTime(r.start_ts)} 起的消息`);
+    });
+    actions.append(set);
+    box.append(actions);
+  };
+  drawNow();
+  drawCtl();
+  return card;
+}
+
 async function importGuildCard(g, onDone) {
   const card = h(`<div class="sheet"><h3 class="tape blue">导入整个服务器的历史</h3>
     <p class="small muted" style="margin-top:0">bot 只会自动保存它进群之后的消息。这里会把每个频道更早的聊天记录拉下来，用来总结记忆。可以重复点，每次都接着往前拉，不会重复。</p>
@@ -903,11 +967,33 @@ async function importGuildCard(g, onDone) {
   return card;
 }
 
+function allContextCard(g, starts, onChange) {
+  const n = Object.keys(starts).length;
+  const card = h(`<div class="sheet"><h3 class="tape yellow">所有频道的上下文</h3>
+    <p class="small muted" style="margin-top:0">${n ? `有 ${n} 个频道设置了上下文起点。` : '让 bot 在所有频道都忘掉之前聊的，比如刚改完人设的时候。'}单个频道可以点开后按时间或消息设置。记忆不受影响。</p>
+    <div class="actions" style="justify-content:flex-start"></div></div>`);
+  const actions = card.querySelector('.actions');
+  const now = h(`<button class="btn">${icon('refresh')}全部从现在开始</button>`);
+  now.onclick = () => {
+    if (!confirm('让 bot 在这个服务器的所有频道都从现在开始，之前的消息不再带进上下文？')) return;
+    run(now, async () => { await api('/api/context/start', { guild_id: g.id, all: true, mode: 'now' }); onChange(); }, '已设置，所有频道从现在开始');
+  };
+  actions.append(now);
+  if (n) {
+    const reset = h('<button class="btn ghost">全部恢复默认</button>');
+    reset.onclick = () => run(reset, async () => { await api('/api/context/clear', { guild_id: g.id, all: true }); onChange(); }, '已全部恢复默认');
+    actions.append(reset);
+  }
+  return card;
+}
+
 async function serverChannels(body, g) {
   const overrides = await api(`/api/config/channels?guild_id=${g.id}`);
+  const { starts } = await api(`/api/context/starts?guild_id=${g.id}`);
   body.innerHTML = '';
   if (g.joined) body.append(await importGuildCard(g, () => loadGuilds()));
-  const card = h(`<div class="sheet"><p class="hint" style="margin-top:0">点开频道可以单独设置人设、上下文和插话；右侧开关控制 bot 是否在这个频道工作。</p><div class="list"></div></div>`);
+  body.append(allContextCard(g, starts, () => serverChannels(body, g)));
+  const card = h(`<div class="sheet"><p class="hint" style="margin-top:0">点开频道可以单独设置人设、上下文起点和插话；右侧开关控制 bot 是否在这个频道工作。</p><div class="list"></div></div>`);
   body.append(card);
   const list = card.querySelector('.list');
   const text = g.channels.filter((c) => c.type !== 'category');
@@ -917,7 +1003,7 @@ async function serverChannels(body, g) {
     const custom = Object.keys(data).filter((k) => k !== 'enabled').length;
     const row = h(`<div class="item"><span class="avatar" style="width:32px;height:32px">${icon('hash')}</span>
       <div class="grow clickable" style="cursor:pointer"><div class="t">${esc(c.name)}</div>
-      <div class="s">${custom ? `<span class="badge blue">单独设置了 ${custom} 项</span>` : '跟随服务器'}</div></div></div>`);
+      <div class="s">${custom ? `<span class="badge blue">单独设置了 ${custom} 项</span>` : '跟随服务器'} ${startBadge(starts[c.id])}</div></div></div>`);
     const sw = h(`<span class="switch"><input type="checkbox" ${data.enabled === false ? '' : 'checked'} aria-label="在 #${esc(c.name)} 启用"><span></span></span>`);
     sw.querySelector('input').onchange = (e) => run(null, async () => {
       const cur = (await api(`/api/config?scope_type=channel&scope_id=${c.id}`)).data || {};
@@ -925,23 +1011,24 @@ async function serverChannels(body, g) {
       await api('/api/config', { scope_type: 'channel', scope_id: c.id, data: cur });
     }, e.target.checked ? `已在 #${c.name} 启用` : `已在 #${c.name} 停用`);
     row.append(sw);
-    row.querySelector('.grow').onclick = () => openChannel(g, c, () => serverChannels(body, g));
+    row.querySelector('.grow').onclick = () => openChannel(g, c, starts[c.id], () => { if (body.isConnected) serverChannels(body, g); });
     list.append(row);
   }
 }
 
-async function openChannel(g, c, onChange) {
+async function openChannel(g, c, start, onChange) {
   const body = h('<div></div>');
   const save = h('<button class="btn ink" disabled>保存</button>');
   let form;
-  const sheet = openSheet({ title: `#${esc(c.name)}`, body, foot: [save], beforeClose: () => !form || !form.count() || confirmLeave() });
+  const sheet = openSheet({ title: `#${esc(c.name)}`, body, foot: [save], beforeClose: () => !form || !form.count() || confirmLeave(), onClose: onChange });
+  body.append(contextStartCard(g.id, c.id, start || null));
   const cfgBox = h('<div></div>');
   body.append(cfgBox);
   form = await configEditor(cfgBox, 'channel', c.id, {
     parentName: '服务器', guildId: g.id, channelId: c.id,
     onDirty: (n) => { save.disabled = !n; save.textContent = n ? `保存 ${n} 处改动` : '保存'; },
   });
-  save.onclick = () => run(save, async () => { await form.save(); if (onChange) onChange(); }, '已保存，立即生效');
+  save.onclick = () => run(save, async () => { await form.save(); }, '已保存，立即生效');
 
   const imp = h(`<div class="sheet"><h3 class="tape blue">导入历史消息</h3>
     <p class="small muted" style="margin-top:0">从 Discord 拉取比已存记录更早的消息，用来总结记忆。</p>
@@ -1287,9 +1374,25 @@ async function setDm(body) {
     sel.onchange = () => form.set('guild_id', sel.value);
     how.append(field(x.mode === 'guild' ? '像在哪个服务器里' : '人设取自', sel));
     how.append(h(`<p class="hint">也可以在私聊里发 <span class="mono">!mode</span> 查看和切换。私聊内容不会写进任何服务器的记忆。</p>`));
-    body.append(who, how);
+    body.append(who, how, convCard);
+  };
+  const convCard = h(`<div class="sheet"><h3 class="tape yellow">私聊上下文</h3>
+    <p class="small muted" style="margin-top:0">点开对话可以设置上下文从哪开始。在私聊里发 <span class="mono">!forget</span> 也能直接从当前开始。</p><div class="list"></div></div>`);
+  const loadConvs = async () => {
+    const { starts, conversations } = await api('/api/context/starts?guild_id=dm');
+    const list = convCard.querySelector('.list');
+    list.innerHTML = conversations.map((c) => `<button class="item" data-cid="${c.channel_id}"><span class="avatar">${icon('mail')}</span>
+      <div class="grow"><div class="t">${esc(c.tag)}</div><div class="s">${c.n} 条消息 · 最后 ${ago(c.last)} ${startBadge(starts[c.channel_id])}</div></div>
+      <span class="chev">${icon('chev')}</span></button>`).join('') || emptyHtml('mail', '还没有私聊记录');
+    $$('[data-cid]', list).forEach((el) => {
+      el.onclick = () => {
+        const c = conversations.find((x) => x.channel_id === el.dataset.cid);
+        openSheet({ title: esc(c.tag), body: contextStartCard('dm', c.channel_id, starts[c.channel_id] || null), onClose: () => { if (convCard.isConnected) loadConvs(); } });
+      };
+    });
   };
   draw();
+  loadConvs();
 }
 
 /* ---------- 用量账本 ---------- */

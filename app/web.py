@@ -308,6 +308,96 @@ async def save_config(body: dict = Body(...)):
     return {"ok": True}
 
 
+# ---------- 上下文起点 ----------
+
+async def _starts(guild_id: str) -> dict:
+    rows = await db.fetchall("SELECT * FROM context_start WHERE guild_id=?", (guild_id,))
+    out = {}
+    for r in rows:
+        after = await db.fetchone(
+            "SELECT COUNT(*) AS n FROM messages WHERE channel_id=? AND deleted=0 AND created_at>=?",
+            (r["channel_id"], r["start_ts"]))
+        first = await db.fetchone(
+            "SELECT * FROM messages WHERE channel_id=? AND deleted=0 AND created_at>=? ORDER BY created_at LIMIT 1",
+            (r["channel_id"], r["start_ts"]))
+        item = {"start_ts": r["start_ts"], "message_id": r["message_id"], "set_at": r["set_at"],
+                "after": after["n"], "first": None}
+        if first:
+            who = "bot" if first["is_self"] else (first["display"] or first["username"])
+            item["first"] = {"who": who, "text": (first["content"] or "")[:80], "ts": first["created_at"]}
+        out[r["channel_id"]] = item
+    return out
+
+
+async def _guild_channel_ids(guild_id: str) -> list[str]:
+    rows = await db.fetchall(
+        "SELECT id FROM channels WHERE guild_id=? UNION SELECT DISTINCT channel_id FROM messages WHERE guild_id=?",
+        (guild_id, guild_id))
+    return [r["id"] for r in rows]
+
+
+@app.get("/api/context/starts", dependencies=A)
+async def context_starts(guild_id: str):
+    data = {"starts": await _starts(guild_id)}
+    if guild_id == context.DM_GUILD:
+        convs = await db.fetchall(
+            "SELECT channel_id, MAX(created_at) AS last, COUNT(*) AS n FROM messages WHERE guild_id=? GROUP BY channel_id "
+            "ORDER BY last DESC", (guild_id,))
+        for c in convs:
+            other = await db.fetchone(
+                "SELECT author_id FROM messages WHERE channel_id=? AND is_self=0 ORDER BY created_at DESC LIMIT 1",
+                (c["channel_id"],))
+            c["tag"] = await context.user_tag(guild_id, other["author_id"]) if other else "（未知）"
+        data["conversations"] = convs
+    return data
+
+
+@app.post("/api/context/start", dependencies=A)
+async def set_context_start(body: dict = Body(...)):
+    gid = str(body.get("guild_id") or "")
+    targets = [str(c) for c in body.get("channel_ids") or []]
+    if body.get("all"):
+        targets = await _guild_channel_ids(gid)
+    if not targets:
+        raise HTTPException(400, "没有选择频道")
+    mode = body.get("mode") or "now"
+    message_id = ""
+    if mode == "now":
+        ts = time.time()
+    elif mode == "time":
+        if not body.get("ts"):
+            raise HTTPException(400, "请选择时间")
+        ts = float(body["ts"])
+    elif mode == "message":
+        if len(targets) != 1:
+            raise HTTPException(400, "按消息设置只能针对单个频道")
+        try:
+            link_channel, message_id = context.parse_message_ref(str(body.get("message") or ""))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if link_channel and link_channel != targets[0]:
+            raise HTTPException(400, "这条消息链接不是这个频道里的")
+        ts = context.snowflake_ts(message_id)
+    else:
+        raise HTTPException(400, "mode 无效")
+    for cid in targets:
+        await context.set_context_start(cid, gid, ts, message_id)
+    log.info("设置了 %d 个频道的上下文起点：%s", len(targets),
+             dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"))
+    return {"ok": True, "start_ts": ts, "starts": await _starts(gid)}
+
+
+@app.post("/api/context/clear", dependencies=A)
+async def clear_context_start(body: dict = Body(...)):
+    gid = str(body.get("guild_id") or "")
+    targets = [str(c) for c in body.get("channel_ids") or []]
+    if body.get("all"):
+        await db.execute("DELETE FROM context_start WHERE guild_id=?", (gid,))
+    for cid in targets:
+        await context.clear_context_start(cid)
+    return {"ok": True, "starts": await _starts(gid)}
+
+
 # ---------- 记忆 ----------
 
 @app.get("/api/memory/list", dependencies=A)

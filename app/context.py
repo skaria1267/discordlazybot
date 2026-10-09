@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import re
+import time
 from zoneinfo import ZoneInfo
 
 from PIL import Image
@@ -139,12 +140,54 @@ async def format_line(row: dict, zone: ZoneInfo, guild_id: str, with_reply: bool
     return f"[{fmt_time(row['created_at'], zone)}] {tag}: {body}{edited}"
 
 
+# ---------- 上下文起点 ----------
+
+DISCORD_EPOCH_MS = 1420070400000
+LINK_RE = re.compile(r"channels/(\d+|@me)/(\d+)/(\d+)")
+
+
+def snowflake_ts(sid: str | int) -> float:
+    """Discord 消息 ID 里自带发送时间。"""
+    return ((int(sid) >> 22) + DISCORD_EPOCH_MS) / 1000
+
+
+def parse_message_ref(text: str) -> tuple[str | None, str]:
+    """接受消息 ID 或消息链接，返回 (频道ID 或 None, 消息ID)。"""
+    text = (text or "").strip()
+    m = LINK_RE.search(text)
+    if m:
+        return m.group(2), m.group(3)
+    if re.fullmatch(r"\d{15,22}", text):
+        return None, text
+    raise ValueError("请填写消息 ID（一串数字）或消息链接")
+
+
+async def context_start(channel_id: str) -> float | None:
+    row = await db.fetchone("SELECT start_ts FROM context_start WHERE channel_id=?", (channel_id,))
+    return row["start_ts"] if row else None
+
+
+async def set_context_start(channel_id: str, guild_id: str, start_ts: float, message_id: str = "") -> None:
+    await db.execute(
+        "INSERT INTO context_start (channel_id, guild_id, start_ts, message_id, set_at) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET guild_id=excluded.guild_id, start_ts=excluded.start_ts, "
+        "message_id=excluded.message_id, set_at=excluded.set_at",
+        (channel_id, guild_id, start_ts, message_id, time.time()))
+
+
+async def clear_context_start(channel_id: str) -> None:
+    await db.execute("DELETE FROM context_start WHERE channel_id=?", (channel_id,))
+
+
 async def load_window(channel_id: str, cfg: dict) -> list[dict]:
     size = max(1, int(cfg.get("context_size") or 40))
+    start = await context_start(channel_id)
+    since = "AND created_at>=? " if start else ""
+    sp = (start,) if start else ()
     if cfg.get("context_mode") == "tokens":
         rows = await db.fetchall(
-            "SELECT * FROM messages WHERE channel_id=? AND deleted=0 ORDER BY created_at DESC LIMIT 600",
-            (channel_id,))
+            f"SELECT * FROM messages WHERE channel_id=? AND deleted=0 {since}ORDER BY created_at DESC LIMIT 600",
+            (channel_id, *sp))
         picked, total = [], 0
         for r in rows:
             t = est_tokens(r["content"] or "") + 20
@@ -155,8 +198,8 @@ async def load_window(channel_id: str, cfg: dict) -> list[dict]:
         rows = picked
     else:
         rows = await db.fetchall(
-            "SELECT * FROM messages WHERE channel_id=? AND deleted=0 ORDER BY created_at DESC LIMIT ?",
-            (channel_id, size))
+            f"SELECT * FROM messages WHERE channel_id=? AND deleted=0 {since}ORDER BY created_at DESC LIMIT ?",
+            (channel_id, *sp, size))
     rows.reverse()
     return rows
 

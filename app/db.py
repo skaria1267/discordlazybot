@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS usage (
     model TEXT, purpose TEXT, input_tokens INTEGER, output_tokens INTEGER,
     cache_read INTEGER, cache_write INTEGER, ok INTEGER);
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage (ts);
+CREATE TABLE IF NOT EXISTS context_start (
+    channel_id TEXT PRIMARY KEY, guild_id TEXT, start_ts REAL, message_id TEXT, set_at REAL);
 CREATE TABLE IF NOT EXISTS errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, logger TEXT, message TEXT, trace TEXT);
 """

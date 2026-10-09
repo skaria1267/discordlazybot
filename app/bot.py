@@ -350,8 +350,16 @@ class LazyBot(discord.Client):
             dm = await store.dm_settings()
             if str(msg.author.id) not in dm["whitelist"]:
                 return
-            if msg.content.strip().lower().startswith(("!mode", "/mode")):
+            low = msg.content.strip().lower()
+            if low.startswith(("!mode", "/mode")):
                 await self.dm_command(msg, dm)
+                return
+            if low in ("!forget", "/forget"):
+                await db.execute("UPDATE messages SET deleted=1 WHERE id=?", (str(msg.id),))
+                sent = await msg.channel.send("好，之前聊的我先不看了，从这里重新开始。（记忆不受影响）")
+                # 起点设在这条回复之后，指令和回复都不会进入上下文
+                await context.set_context_start(str(msg.channel.id), DM, sent.created_at.timestamp() + 0.001, "")
+                log.info("私聊 %s 使用 !forget 清空了上下文", msg.author)
                 return
         q = self.queues.get(msg.channel.id)
         if q is None:
@@ -486,10 +494,13 @@ class LazyBot(discord.Client):
     async def judge(self, channel, cfg, general) -> tuple[str, str, dict]:
         gid = str(channel.guild.id)
         n = int(general.get("judge_context_lines") or 15)
+        start = await context.context_start(str(channel.id)) or 0
         rows = await db.fetchall(
-            "SELECT * FROM messages WHERE channel_id=? AND deleted=0 ORDER BY created_at DESC LIMIT ?",
-            (str(channel.id), n))
+            "SELECT * FROM messages WHERE channel_id=? AND deleted=0 AND created_at>=? ORDER BY created_at DESC LIMIT ?",
+            (str(channel.id), start, n))
         rows.reverse()
+        if not rows:
+            return "IGNORE", "", {}
         zone = context.tz(general["timezone"])
         lines = []
         for r in rows:
@@ -632,6 +643,7 @@ class LazyBot(discord.Client):
                      "`!mode guild <服务器ID>` 加载该服务器的人设和记忆",
                      "`!mode persona <服务器ID|global>` 只用人设，不加载记忆",
                      "`!mode own [服务器ID|global]` 私聊独立记忆，人设取自该服务器或全局",
+                     "`!forget` 忘掉之前的私聊上下文，从这里重新开始（记忆不受影响）",
                      "", "服务器列表："] + [f"`{k}` {v}" for k, v in guild_names.items()]
             reply = "\n".join(lines)
         else:
