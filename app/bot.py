@@ -569,7 +569,9 @@ class LazyBot(discord.Client):
         context.append_note(messages, context.request_note(general, target_tag, interject))
         async with channel.typing():
             text = await llm.call("chat", system, messages, guild_id=None if is_dm else gid,
-                                  provider_id=cfg.get("chat_provider") or "", model=cfg.get("chat_model") or "")
+                                  provider_id=cfg.get("chat_provider") or "", model=cfg.get("chat_model") or "",
+                                  tool_mode=cfg.get("chat_tools") or "off",
+                                  tool_rounds=cfg.get("chat_tool_rounds", 4))
         out = context.parse_output(text)
         sticker = None
         for code in out["stickers"][:1]:

@@ -142,6 +142,11 @@ img { display: block; }
 .hr { border: 0; border-top: 1px dashed var(--rule); margin: 14px 0; }
 .row { display: flex; align-items: center; gap: 10px; }
 .row.wrap { flex-wrap: wrap; }
+.model-picker { min-width: 0; }
+.model-picker > .row { margin-top: 6px; }
+.model-picker select { min-width: 0; width: 0; }
+.model-picker .btn { flex-shrink: 0; }
+.search-test { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow: auto; }
 .grow { flex: 1 1 auto; min-width: 0; }
 .right { margin-left: auto; }
 .stack > * + * { margin-top: 12px; }

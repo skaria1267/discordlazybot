@@ -107,7 +107,10 @@ async function loadGuilds() {
 }
 async function loadProviders(force) {
   if (!state.providers || force) {
-    try { state.providers = (await api('/api/providers')).providers; } catch (_) { state.providers = []; }
+    try {
+      state.providers = (await api('/api/providers')).providers;
+      state.providers.forEach((p) => { state.modelLists[p.id] = p.model_list || []; });
+    } catch (_) { state.providers = []; }
   }
   return state.providers;
 }
@@ -154,6 +157,39 @@ function textInput(value, onChange, { placeholder = '', type = 'text', list = ''
   const el = h(`<input type="${type}" value="${esc(value ?? '')}" placeholder="${esc(placeholder)}" ${list ? `list="${list}"` : ''} ${disabled ? 'disabled' : ''} autocomplete="off">`);
   el.oninput = () => onChange(el.value);
   return el;
+}
+
+// 原生下拉方便手机选填，文本框始终允许输入列表以外的模型名。
+function modelInput(value, onChange, { providerId = '', disabled = false } = {}) {
+  const box = h('<div class="model-picker"></div>');
+  const input = textInput(value, onChange, { placeholder: '选择或填写模型名', disabled });
+  input.setAttribute('aria-label', '模型名，可自行输入');
+  const row = h('<div class="row"></div>');
+  const select = h(`<select class="grow" aria-label="已拉取的模型" ${disabled ? 'disabled' : ''}></select>`);
+  const button = h(`<button type="button" class="btn sm" ${disabled || !providerId ? 'disabled' : ''}>${icon('refresh')}拉取</button>`);
+  const fill = () => {
+    const models = state.modelLists[providerId] || [];
+    select.innerHTML = `<option value="">${models.length ? `从 ${models.length} 个模型中选择` : '尚未拉取模型，可直接填写'}</option>` +
+      models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    select.value = models.includes(input.value) ? input.value : '';
+  };
+  select.onchange = () => { if (select.value) { input.value = select.value; onChange(select.value); } };
+  input.oninput = () => { onChange(input.value); select.value = (state.modelLists[providerId] || []).includes(input.value) ? input.value : ''; };
+  button.onclick = (e) => run(e.currentTarget, async () => {
+    const r = await api('/api/providers/models', { provider: { id: providerId } });
+    if (!r.ok) throw new Error(r.error);
+    state.modelLists[providerId] = r.models;
+    if (state.providers) {
+      const p = state.providers.find((x) => x.id === providerId);
+      if (p) p.model_list = r.models;
+    }
+    fill();
+    toast(`已拉取 ${r.models.length} 个模型`);
+  });
+  fill();
+  row.append(select, button);
+  box.append(input, row);
+  return box;
 }
 
 /* 未保存便签 */
@@ -421,7 +457,7 @@ const CFG_SECTIONS = [
   { id: 'persona', title: '人设', tape: 'pink', keys: ['persona'] },
   { id: 'reply', title: '回复与上下文', tape: 'blue', keys: ['enabled', 'reply_enabled', 'context_mode', 'context_size', 'image_limit', 'memory_enabled'] },
   { id: 'interject', title: '主动插话', tape: 'yellow', keys: ['interject_enabled', 'interject_prob', 'interject_cooldown', 'interject_max', 'interject_window'] },
-  { id: 'model', title: '聊天模型', tape: 'green', keys: ['chat_provider', 'chat_model'] },
+  { id: 'model', title: '聊天模型与联网', tape: 'green', keys: ['chat_provider', 'chat_model', 'chat_tools', 'chat_tool_rounds'] },
 ];
 
 /**
@@ -539,14 +575,20 @@ const SECTION_RENDER = {
   model(body, { val, set, dis, providers }) {
     const sel = h(`<select ${dis ? 'disabled' : ''}><option value="">使用「接口与模型」里的聊天模型</option>
       ${providers.map((p) => `<option value="${p.id}" ${p.id === val('chat_provider') ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`);
-    const listId = 'ml-chat-' + Math.random().toString(36).slice(2, 7);
-    const dl = h(`<datalist id="${listId}"></datalist>`);
-    const fillList = () => { dl.innerHTML = (state.modelLists[sel.value] || []).map((m) => `<option value="${esc(m)}">`).join(''); };
-    sel.onchange = () => { set('chat_provider', sel.value); fillList(); };
-    fillList();
+    const wrap = h('<div></div>');
+    const fillModel = () => {
+      wrap.replaceChildren(field('模型名', modelInput(val('chat_model'), (v) => set('chat_model', v),
+        { providerId: sel.value, disabled: dis }), '可选择拉取的模型，也可直接填写名字；留空沿用默认聊天模型'));
+    };
+    sel.onchange = () => { set('chat_provider', sel.value); fillModel(); };
+    fillModel();
     body.append(field('供应商', sel));
-    body.append(field('模型名', textInput(val('chat_model'), (v) => set('chat_model', v), { list: listId, disabled: dis, placeholder: '例如 claude-opus-5-5' }), '想让这里用和全局不同的模型时才需要设置'));
-    body.append(dl);
+    body.append(wrap);
+    const mode = h(`<select ${dis ? 'disabled' : ''}><option value="off">纯聊天</option><option value="external">工具调用 + 搜索服务</option><option value="claude">Claude 原生联网搜索</option></select>`);
+    mode.value = val('chat_tools') || 'off';
+    mode.onchange = () => set('chat_tools', mode.value);
+    body.append(field('联网方式', mode, '搜索服务模式支持 OpenAI 兼容与 Claude；请先在「设置 → 联网搜索」配置服务。原生搜索需要 Claude 格式及供应商支持。'));
+    body.append(field('最多工具调用轮数', numberInput(val('chat_tool_rounds') || 4, (v) => set('chat_tool_rounds', v), { min: 1, disabled: dis }), '1–8 轮，仅影响聊天回复；缓存断点由反代处理'));
   },
 };
 
@@ -1191,6 +1233,7 @@ async function pageLogs(main) {
 const SETTINGS = [
   ['bot', 'key', '机器人连接', 'token、在线状态和邀请链接'],
   ['api', 'chat', '接口与模型', '反代地址、Key，以及各用途用哪个模型'],
+  ['search', 'search', '联网搜索', '配置聊天工具使用的搜索服务'],
   ['persona', 'pen', '默认人设', '所有服务器默认的人设、上下文和插话方式'],
   ['dm', 'mail', '私聊', '谁能私聊 bot，私聊时用哪套人设和记忆'],
   ['usage', 'coin', '用量账本', '每天用了多少 tokens、花了多少钱'],
@@ -1214,7 +1257,7 @@ async function pageSettingsSub(main, key) {
   const body = h('<div></div>');
   main.append(body);
   body.innerHTML = skeleton(3);
-  await ({ bot: setBot, api: setApi, persona: setPersona, dm: setDm, usage: setUsage, general: setGeneral, password: setPassword })[key](body);
+  await ({ bot: setBot, api: setApi, search: setSearch, persona: setPersona, dm: setDm, usage: setUsage, general: setGeneral, password: setPassword })[key](body);
 }
 
 /* ---------- 机器人连接 ---------- */
@@ -1269,6 +1312,7 @@ const PURPOSE_HELP = {
 
 async function setApi(body) {
   const res = await api('/api/providers');
+  res.providers.forEach((p) => { state.modelLists[p.id] = p.model_list || []; });
   const initial = { providers: res.providers.map((p) => ({ ...p, api_key: '' })), models: res.models };
   const expanded = new Set(initial.providers.length ? [] : ['new0']);
   let form;
@@ -1336,10 +1380,9 @@ async function setApi(body) {
       const row = el.querySelector('.row.wrap');
       const sel = h(`<select style="flex:1 1 130px"><option value="">选择供应商</option>${saved.map((p) => `<option value="${p.id}" ${p.id === m.provider ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`);
       sel.onchange = () => { upd('provider', sel.value); draw(); };
-      const inp = textInput(m.model, (v) => upd('model', v), { placeholder: '模型名', list: m.provider ? `ml-m-${m.provider}` : '' });
+      const inp = modelInput(m.model, (v) => upd('model', v), { providerId: m.provider || '' });
       inp.style.flex = '1 1 160px';
       row.append(sel, inp);
-      if (m.provider && state.modelLists[m.provider]) el.append(h(`<datalist id="ml-m-${esc(m.provider)}">${state.modelLists[m.provider].map((x) => `<option value="${esc(x)}">`).join('')}</datalist>`));
       const adv = h(`<details style="margin-top:6px"><summary>输出长度和温度</summary><div class="row" style="padding-top:6px"></div></details>`);
       const a = field('最大输出 tokens', numberInput(m.max_tokens ?? 1024, (v) => upd('max_tokens', v), { min: 16 }), '开了思考的模型要给大一些，比如 2000 以上');
       const b = field('温度', numberInput(m.temperature ?? 0.9, (v) => upd('temperature', v), { step: '0.05', min: 0 }));
@@ -1357,6 +1400,7 @@ async function setApi(body) {
       await api('/api/models', { models: draft.models });
       draft.providers = r.providers.map((p) => ({ ...p, api_key: '' }));
       state.providers = r.providers;
+      r.providers.forEach((p) => { state.modelLists[p.id] = p.model_list || []; });
       expanded.clear();
       setTimeout(draw, 0);
     },
@@ -1367,6 +1411,44 @@ async function setApi(body) {
 }
 
 /* ---------- 默认人设 ---------- */
+async function setSearch(body) {
+  const saved = await api('/api/search');
+  const form = makeForm({ ...saved, api_key: '', clear_key: false }, {
+    onSave: async (draft) => {
+      const r = await api('/api/search', draft);
+      Object.assign(draft, r.data, { api_key: '', clear_key: false });
+      setTimeout(draw, 0);
+    }, onDirty: barDirty, onReset: () => draw(),
+  });
+  const draw = () => {
+    body.innerHTML = '';
+    const card = h('<div class="sheet"><h3 class="tape blue">搜索服务</h3></div>');
+    const select = h('<select><option value="tavily">Tavily</option><option value="searxng">SearXNG</option></select>');
+    select.value = form.draft.backend;
+    select.onchange = () => {
+      form.set('backend', select.value);
+      form.set('base_url', select.value === 'tavily' ? 'https://api.tavily.com' : '');
+      draw();
+    };
+    card.append(field('服务', select));
+    card.append(field('服务地址', textInput(form.draft.base_url, (v) => form.set('base_url', v), { placeholder: 'https://' }), '填写服务根地址或 /search 地址；SearXNG 必须开启 JSON 格式'));
+    card.append(field(`API Key${form.draft.api_key_masked ? `（当前 ${form.draft.api_key_masked}）` : ''}`, textInput(form.draft.api_key, (v) => form.set('api_key', v), { type: 'password' }), 'Tavily 需要 Key；留空保留原值。SearXNG 不发送此 Key。'));
+    card.append(switchRow('清除已保存的 Key', '', form.draft.clear_key, (v) => form.set('clear_key', v)));
+    card.append(field('每次搜索最多结果数', numberInput(form.draft.max_results, (v) => form.set('max_results', v), { min: 1 }), '1–10 条'));
+    const test = h('<div><div class="field"><span class="lab">测试搜索词</span><input type="text" aria-label="测试搜索词" value="今天的新闻"></div><div class="actions"><button type="button" class="btn">测试已保存的配置</button></div><pre class="search-test" hidden></pre></div>');
+    test.querySelector('button').onclick = (e) => run(e.currentTarget, async () => {
+      const r = await api('/api/search/test', { query: test.querySelector('input').value });
+      const out = test.querySelector('pre');
+      out.hidden = false;
+      out.textContent = JSON.stringify(r.result, null, 2);
+      if (!r.ok) throw new Error(r.result.error || '搜索失败');
+    });
+    card.append(test);
+    body.append(card, h('<p class="hint">在「默认人设」或服务器、频道的「聊天模型与联网」里开启搜索服务模式。Claude 原生搜索直接使用模型供应商，无需此处的服务或 Key。纯聊天不调用搜索。</p>'));
+  };
+  draw();
+}
+
 async function setPersona(body) {
   body.innerHTML = '<p class="small muted" style="margin:0 0 14px 2px">这里是所有服务器的默认值。某个服务器想要不一样，到「服务器 › 人设」里单独设置。</p>';
   const box = h('<div></div>');

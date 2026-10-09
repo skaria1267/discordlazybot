@@ -14,7 +14,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, context, crypto, db, llm, logbuf, memory, store
+from . import config, context, crypto, db, llm, logbuf, memory, store, tools
 from .bot import manager
 
 log = logging.getLogger("web")
@@ -304,7 +304,10 @@ async def save_config(body: dict = Body(...)):
     st = body.get("scope_type")
     if st not in ("global", "guild", "channel"):
         raise HTTPException(400, "scope_type 无效")
-    await store.set_scope(st, str(body.get("scope_id") or "global"), body.get("data") or {})
+    try:
+        await store.set_scope(st, str(body.get("scope_id") or "global"), body.get("data") or {})
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e)) from e
     return {"ok": True}
 
 
@@ -517,7 +520,15 @@ async def save_providers(body: dict = Body(...)):
 @app.post("/api/providers/models", dependencies=A)
 async def provider_models(body: dict = Body(...)):
     try:
-        return {"ok": True, "models": await llm.list_models(body.get("provider") or {})}
+        provider = body.get("provider") or {}
+        models = await llm.list_models(provider)
+        # 只有已保存、且地址/格式一致的列表才写入对应供应商。
+        if provider.get("id"):
+            effective = await llm._with_saved_key(provider)
+            saved = next((p for p in await llm.get_providers() if p["id"] == provider["id"]), None)
+            if saved and all(saved.get(k) == effective.get(k) for k in ("base_url", "format")):
+                await llm.cache_model_list(provider["id"], models)
+        return {"ok": True, "models": models}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e), "models": []}
 
@@ -544,6 +555,29 @@ async def save_models(body: dict = Body(...)):
         }
     await db.set_setting("models", data)
     return {"ok": True}
+
+
+# ---------- 搜索服务 ----------
+
+@app.get("/api/search", dependencies=A)
+async def get_search():
+    return await tools.settings()
+
+
+@app.post("/api/search", dependencies=A)
+async def save_search(body: dict = Body(...)):
+    try:
+        await tools.save_settings(body)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True, "data": await tools.settings()}
+
+
+@app.post("/api/search/test", dependencies=A)
+async def test_search(body: dict = Body(default={})):
+    result, error = await tools.execute("web_search", {"query": body.get("query", "今天的新闻")},
+                                        await tools.settings(with_key=True))
+    return {"ok": not error, "result": json.loads(result)}
 
 
 # ---------- 通用设置 / 私聊 / 价格 ----------

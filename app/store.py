@@ -19,6 +19,8 @@ SCOPE_DEFAULTS: dict = {
     "interject_window": 60,       # 窗口长度（分钟）
     "chat_provider": "",          # 留空 = 使用 API 页面里"聊天"用途的配置
     "chat_model": "",
+    "chat_tools": "off",         # off=纯聊天; external=搜索服务; claude=Claude 原生搜索
+    "chat_tool_rounds": 4,        # 最多执行几轮工具调用 / 原生搜索续轮
 }
 
 GENERAL_DEFAULTS: dict = {
@@ -52,6 +54,13 @@ async def get_scope(scope_type: str, scope_id: str) -> dict:
 
 async def set_scope(scope_type: str, scope_id: str, data: dict) -> None:
     clean = {k: v for k, v in data.items() if k in SCOPE_DEFAULTS and v is not None}
+    if "chat_tools" in clean and clean["chat_tools"] not in ("off", "external", "claude"):
+        raise ValueError("聊天工具模式无效")
+    if "chat_tool_rounds" in clean:
+        rounds = int(clean["chat_tool_rounds"])
+        if not 1 <= rounds <= 8:
+            raise ValueError("工具调用轮数必须在 1 到 8 之间")
+        clean["chat_tool_rounds"] = rounds
     await db.execute(
         "INSERT INTO scope_config (scope_type, scope_id, data) VALUES (?, ?, ?) "
         "ON CONFLICT(scope_type, scope_id) DO UPDATE SET data=excluded.data",
