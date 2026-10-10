@@ -625,7 +625,9 @@ async function openPreview(guildId, channelId) {
 
 async function serverPersona(body, g) {
   body.innerHTML = '';
-  await configEditor(body, 'guild', g.id, { parentName: '全局', guildId: g.id });
+  // 表情相关设置放在「表情」页
+  const sections = CFG_SECTIONS.map((s) => s.id).filter((id) => id !== 'emoji');
+  await configEditor(body, 'guild', g.id, { parentName: '全局', guildId: g.id, sections });
   body.append(h(`<p class="hint" style="text-align:center">全局默认值在「设置 › 默认人设」里修改。单个频道的设置在「频道」里。</p>`));
 }
 
@@ -1142,6 +1144,9 @@ async function serverEmoji(body, g) {
   const rows = await api(`/api/emojis?guild_id=${g.id}`);
   let filter = 'all';
   body.innerHTML = '';
+  const cfgBox = h('<div></div>');
+  body.append(cfgBox);
+  await configEditor(cfgBox, 'guild', g.id, { parentName: '全局', guildId: g.id, sections: ['emoji'] });
   const top = h(`<div class="sheet"><div class="chips"></div><p class="hint" style="margin-bottom:0">新表情会自动生成描述，模型就是按描述挑表情的。手动改过的描述不会被覆盖。</p></div>`);
   const gridCard = h('<div class="sheet"><div class="emoji-grid"></div></div>');
   body.append(top, gridCard);
