@@ -719,14 +719,16 @@ async def preview(guild_id: str = "", channel_id: str = ""):
     for r in reversed(rows):
         if not r["is_self"] and r["author_id"] not in user_ids:
             user_ids.append(r["author_id"])
-    emoji_text, _ = await emoji_mod.candidates(guild_id, int(general.get("emoji_candidates") or 0))
+    emoji_text, _ = await emoji_mod.candidates(guild_id or context.DM_GUILD,
+                                               (cfg.get("emoji_scope") or "guild") if guild_id else "all",
+                                               int(cfg.get("emoji_limit") or 0))
     sticker_text = (await emoji_mod.sticker_candidates(guild_id))[0] if guild_id else ""
     g = await db.fetchone("SELECT name FROM guilds WHERE id=?", (guild_id,)) if guild_id else None
     ch = await db.fetchone("SELECT name FROM channels WHERE id=?", (channel_id,)) if channel_id else None
     location = (f"服务器「{g['name']}」的 #{ch['name'] if ch else channel_id} 频道" if g
                 else "（预览：未指定服务器）")
     system = await context.build_system(cfg, general, guild_id, location, user_ids[:20], emoji_text, sticker_text)
-    msgs = await context.build_messages(rows, guild_id, {**cfg, "image_limit": 0}, general)
+    msgs = await context.build_messages(rows, guild_id, {**cfg, "image_limit": 0, "emoji_images": False}, general)
     last_user = next((r for r in reversed(rows) if not r["is_self"]), None)
     target = await context.user_tag(guild_id, last_user["author_id"]) if last_user and guild_id else ""
     context.append_note(msgs, context.request_note(general, target))

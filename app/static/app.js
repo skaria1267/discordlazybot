@@ -455,7 +455,8 @@ const PRESETS = {
 };
 const CFG_SECTIONS = [
   { id: 'persona', title: '人设', tape: 'pink', keys: ['persona'] },
-  { id: 'reply', title: '回复与上下文', tape: 'blue', keys: ['enabled', 'reply_enabled', 'context_mode', 'context_size', 'image_limit', 'memory_enabled'] },
+  { id: 'reply', title: '回复与上下文', tape: 'blue', keys: ['enabled', 'reply_enabled', 'context_mode', 'context_size', 'image_limit', 'reply_image_limit', 'memory_enabled'] },
+  { id: 'emoji', title: '表情', tape: 'yellow', keys: ['emoji_scope', 'emoji_limit', 'emoji_images', 'emoji_image_limit'] },
   { id: 'interject', title: '主动插话', tape: 'yellow', keys: ['interject_enabled', 'interject_prob', 'interject_cooldown', 'interject_max', 'interject_window'] },
   { id: 'model', title: '聊天模型与联网', tape: 'green', keys: ['chat_provider', 'chat_model', 'chat_tools', 'chat_tool_rounds'] },
 ];
@@ -541,6 +542,17 @@ const SECTION_RENDER = {
     drawSize();
     body.append(sizeWrap);
     body.append(field('最多带几张图片', numberInput(val('image_limit'), (v) => set('image_limit', v), { min: 0, disabled: dis }), '只取最近的几张，设为 0 则不看图'));
+    body.append(field('被回复的消息里最多看几张图', numberInput(val('reply_image_limit'), (v) => set('reply_image_limit', v), { min: 0, disabled: dis }), '有人回复一条带图的消息来找 bot 时，把那条消息里的图也给它看，不占上面的名额；设为 0 则不看'));
+  },
+  emoji(body, { val, set, dis }) {
+    body.append(field('用哪些表情', seg([['guild', '只用本服务器的'], ['all', 'bot 所在所有服务器的']], val('emoji_scope'), (v) => set('emoji_scope', v), { disabled: dis }),
+      '选所有服务器时本服务器的优先；用别的服务器的表情需要 bot 在频道里有「使用外部表情」权限'));
+    body.append(field('最多给模型看多少个表情', numberInput(val('emoji_limit'), (v) => set('emoji_limit', v), { min: 0, disabled: dis }),
+      '表情多于这个数时按常用程度挑选，挑选结果一天更新一次，避免频繁变动影响提示词缓存；设为 0 则不用表情'));
+    body.append(h('<hr class="hr">'));
+    body.append(switchRow('让 bot 看到群友用的表情长什么样', '上下文里的服务器表情附上小图，不占「最多带几张图片」的名额；同一个表情只附一次', val('emoji_images'), (v) => set('emoji_images', v), dis));
+    body.append(field('表情图片最多几张', numberInput(val('emoji_image_limit'), (v) => set('emoji_image_limit', v), { min: 0, disabled: dis }),
+      '一次请求里最多附几张不同的表情图，0 为不限。Claude 接口一次最多 100 张图（含普通图片），超了会报错'));
   },
   interject(body, { val, set, dis, redraw }) {
     body.append(switchRow('允许主动插话', '没人叫它时，偶尔自己接话或点个表情', val('interject_enabled'), (v) => set('interject_enabled', v), dis));
@@ -1585,7 +1597,6 @@ const GENERAL_FIELDS = [
   ['timezone', '时区', 'text', '聊天记录里的时间戳按这个时区显示，例如 Asia/Shanghai'],
   ['debounce_seconds', '防抖等待（秒）', 'number', '收到消息后等这么久没有新消息再处理，避免连发好几条回复'],
   ['gap_minutes', '标注时间间隔（分钟）', 'number', '两条消息相隔超过这么久时，在上下文里写明隔了多久'],
-  ['emoji_candidates', '候选表情数量', 'number', '每次给模型看多少个表情，优先本服务器常用的'],
   ['max_reactions', '每次最多点几个反应', 'number', ''],
   ['judge_context_lines', '插话判断看多少条消息', 'number', '判断要不要插话时，给小模型看最近几条'],
   ['respond_to_bots', '回应其他 bot', 'bool', '打开后其他 bot 的消息也可能触发回复，小心两个 bot 互相聊个没完'],

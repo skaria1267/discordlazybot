@@ -61,10 +61,12 @@ async def sync_guild(guild) -> None:
         await db.execute(f"UPDATE emojis SET available=0 WHERE guild_id=? AND id NOT IN ({marks})", [gid, *seen])
     else:
         await db.execute("UPDATE emojis SET available=0 WHERE guild_id=?", (gid,))
+    invalidate_picks()
 
 
 async def mark_guild_left(guild_id: str) -> None:
     await db.execute("UPDATE emojis SET available=0 WHERE guild_id=?", (guild_id,))
+    invalidate_picks()
 
 
 async def count_usage(guild_id: str, keys: list[str]) -> None:
@@ -78,23 +80,77 @@ def keys_in_text(text: str) -> list[str]:
     return [m.group(2) for m in CUSTOM_EMOJI_RE.finditer(text or "")]
 
 
-async def candidates(guild_id: str, limit: int) -> tuple[str, dict]:
-    """返回 (给模型看的列表文本, 代码→表情信息)。优先本服务器常用的表情。"""
+# 每个 (服务器, 范围, 数量) 选中的表情 ID 列表会缓存一段时间，避免使用次数一变就换表情、破坏提示词缓存
+_pick_cache: dict[tuple, tuple[float, list[str]]] = {}
+PICK_TTL = 24 * 3600
+
+
+def invalidate_picks() -> None:
+    _pick_cache.clear()
+
+
+async def candidates(guild_id: str, scope: str, limit: int) -> tuple[str, dict]:
+    """返回 (给模型看的列表文本, 名称→表情信息)。
+
+    scope=guild 只给本服务器的表情，scope=all 给 bot 所在所有服务器的表情（本服务器优先）。
+    数量超过 limit 时按使用次数挑选，挑出来的结果按表情 ID 固定排序列出。
+    """
+    limit = max(0, int(limit or 0))
+    if not limit:
+        return "", {}
+    only_guild = scope != "all"
+    key = (guild_id, "guild" if only_guild else "all", limit)
+    hit = _pick_cache.get(key)
+    if hit and time.time() - hit[0] < PICK_TTL:
+        ids = hit[1]
+    else:
+        rows = await db.fetchall(
+            "SELECT e.id FROM emojis e LEFT JOIN emoji_usage u ON u.emoji_key=e.id AND u.guild_id=? "
+            "WHERE e.kind='emoji' AND e.available=1" + (" AND e.guild_id=?" if only_guild else "")
+            + " ORDER BY COALESCE(u.count, 0) DESC, (e.guild_id=?) DESC, (e.description IS NOT NULL) DESC, "
+            "CAST(e.id AS INTEGER) LIMIT ?",
+            (guild_id, guild_id, guild_id, limit) if only_guild else (guild_id, guild_id, limit))
+        ids = [r["id"] for r in rows]
+        _pick_cache[key] = (time.time(), ids)
+    if not ids:
+        return "", {}
     rows = await db.fetchall(
-        "SELECT e.id, e.name, e.description, e.animated, e.guild_id, COALESCE(u.count, 0) AS cnt "
-        "FROM emojis e LEFT JOIN emoji_usage u ON u.emoji_key=e.id AND u.guild_id=? "
-        "WHERE e.kind='emoji' AND e.available=1 "
-        "ORDER BY cnt DESC, (e.guild_id=?) DESC, (e.description IS NOT NULL) DESC, e.name LIMIT ?",
-        (guild_id, guild_id, max(0, limit)))
-    # 选出哪些表情按常用程度，列出来的顺序按表情 ID 固定，避免使用次数变化打乱顺序、破坏提示词缓存
+        f"SELECT id, name, description, animated, guild_id FROM emojis WHERE available=1 "
+        f"AND id IN ({','.join('?' * len(ids))})", ids)
     rows.sort(key=lambda r: int(r["id"]))
     mapping, lines = {}, []
-    for i, r in enumerate(rows, 1):
-        code = f"e{i}"
-        mapping[code] = r
-        desc = r["description"] or f"（名称：{r['name']}）"
-        lines.append(f"{code} | {desc}")
+    for r in rows:
+        # 重名的表情加上序号区分
+        code, n = r["name"], 1
+        while code.lower() in mapping:
+            n += 1
+            code = f"{r['name']}_{n}"
+        mapping[code.lower()] = r
+        lines.append(f":{code}: | {r['description'] or '（暂无描述）'}")
     return "\n".join(lines), mapping
+
+
+def lookup(code: str, mapping: dict) -> dict | None:
+    """接受 :名称: 或 名称，返回表情信息。"""
+    return mapping.get(code.strip().strip(":").lower())
+
+
+def discord_code(row: dict) -> str:
+    return f"<{'a' if row['animated'] else ''}:{row['name']}:{row['id']}>"
+
+
+def to_discord(text: str, mapping: dict) -> str:
+    """把回复里的 :名称: 换成 Discord 自定义表情；不认识的名称和已经是 <:名称:ID> 的保持原样。"""
+    if not mapping or not text:
+        return text
+
+    def sub(m):
+        if m.group(1) is None:
+            return m.group(0)
+        row = lookup(m.group(1), mapping)
+        return discord_code(row) if row else m.group(0)
+
+    return re.sub(r"<a?:\w+:\d+>|:(\w+):", sub, text)
 
 
 async def sticker_candidates(guild_id: str, limit: int = 20) -> tuple[str, dict]:

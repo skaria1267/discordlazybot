@@ -18,6 +18,7 @@ USER_MENTION = re.compile(r"<@!?(\d+)>")
 ROLE_MENTION = re.compile(r"<@&(\d+)>")
 CHANNEL_MENTION = re.compile(r"<#(\d+)>")
 CUSTOM_EMOJI = re.compile(r"<a?:(\w+):\d+>")
+CUSTOM_EMOJI_FULL = re.compile(r"<a?:(\w+):(\d+)>")
 UNICODE_EMOJI_HINT = re.compile(r"^[^\w\s<>]{1,8}$")
 
 
@@ -37,6 +38,32 @@ def split_text(text: str, limit: int = 1900) -> list[str]:
     if text:
         out.append(text)
     return [x for x in out if x]
+
+
+def emoji_entries(content: str) -> list[dict]:
+    """消息里用到的自定义表情。正文存的是 :名称:，ID 记在这里，之后才能把表情当图片给模型看。"""
+    out, seen = [], set()
+    for m in CUSTOM_EMOJI_FULL.finditer(content or ""):
+        if m.group(1) not in seen:
+            seen.add(m.group(1))
+            out.append({"kind": "emoji", "name": m.group(1), "id": m.group(2)})
+    return out
+
+
+def extract_images(msg: discord.Message) -> list[dict]:
+    """消息里的图片、文件、贴纸、动图，存库和看被回复的消息时共用。"""
+    images = []
+    for a in msg.attachments:
+        if (a.content_type or "").startswith("image/"):
+            images.append({"url": a.url, "kind": "image", "label": "图片"})
+        else:
+            images.append({"kind": "file", "label": f"文件：{a.filename}"})
+    for s in msg.stickers:
+        images.append({"kind": "sticker", "label": f"贴纸：{s.name}"})
+    for e in msg.embeds:
+        if e.type in ("gifv", "image") and (e.thumbnail and e.thumbnail.url):
+            images.append({"url": e.thumbnail.url, "kind": "image", "label": "动图" if e.type == "gifv" else "图片"})
+    return images
 
 
 class ChannelQueue:
@@ -304,17 +331,7 @@ class LazyBot(discord.Client):
         if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
             return
         gid = DM if msg.guild is None else str(msg.guild.id)
-        images = []
-        for a in msg.attachments:
-            if (a.content_type or "").startswith("image/"):
-                images.append({"url": a.url, "kind": "image", "label": "图片"})
-            else:
-                images.append({"kind": "file", "label": f"文件：{a.filename}"})
-        for s in msg.stickers:
-            images.append({"kind": "sticker", "label": f"贴纸：{s.name}"})
-        for e in msg.embeds:
-            if e.type in ("gifv", "image") and (e.thumbnail and e.thumbnail.url):
-                images.append({"url": e.thumbnail.url, "kind": "image", "label": "动图" if e.type == "gifv" else "图片"})
+        images = extract_images(msg) + emoji_entries(msg.content)
         is_self = bool(self.user and msg.author.id == self.user.id)
         if not is_self:
             await self.upsert_member(gid, msg.author)
@@ -370,12 +387,14 @@ class LazyBot(discord.Client):
         content = payload.data.get("content")
         if content is None:
             return
-        row = await db.fetchone("SELECT guild_id, is_self FROM messages WHERE id=?", (str(payload.message_id),))
+        row = await db.fetchone("SELECT guild_id, is_self, images FROM messages WHERE id=?",
+                                (str(payload.message_id),))
         if not row:
             return
         text = content if row["is_self"] else await self.render(content, row["guild_id"])
-        await db.execute("UPDATE messages SET content=?, edited_at=? WHERE id=?",
-                         (text, time.time(), str(payload.message_id)))
+        images = [im for im in json.loads(row["images"] or "[]") if im.get("kind") != "emoji"] + emoji_entries(content)
+        await db.execute("UPDATE messages SET content=?, images=?, edited_at=? WHERE id=?",
+                         (text, json.dumps(images, ensure_ascii=False), time.time(), str(payload.message_id)))
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
         await db.execute("UPDATE messages SET deleted=1 WHERE id=?", (str(payload.message_id),))
@@ -508,14 +527,15 @@ class LazyBot(discord.Client):
                 lines.append(f"[{context.fmt_time(r['created_at'], zone)}] 【你】: {r['content']}")
             else:
                 lines.append(await context.format_line(r, zone, gid))
-        emoji_text, emap = await emoji.candidates(gid, min(40, int(general.get("emoji_candidates") or 40)))
+        emoji_text, emap = await emoji.candidates(gid, cfg.get("emoji_scope") or "guild",
+                                                  min(40, int(cfg.get("emoji_limit") or 0)))
         system = "你要替一个群聊角色判断此刻是否应该主动插话。角色设定：\n" + (cfg.get("persona") or "")[:1500]
         prompt = ("最近的聊天记录：\n" + "\n".join(lines)
-                  + ("\n\n可用表情（代码 | 描述）：\n" + emoji_text if emoji_text else "")
+                  + ("\n\n可用表情（:名称: | 描述）：\n" + emoji_text if emoji_text else "")
                   + "\n\n这些消息没有 @ 你，也没有回复你。判断你现在是否适合自然地加入聊天。"
                   "只输出一行，三选一：\n"
                   "SPEAK —— 有话想说，适合插话\n"
-                  "REACT 代码 —— 不说话，只给最后一条消息点个表情（代码取自可用表情，或一个 Unicode emoji）\n"
+                  "REACT 表情 —— 不说话，只给最后一条消息点个表情（写可用表情里的 :名称:，或一个 Unicode emoji）\n"
                   "IGNORE —— 不打扰\n"
                   "大多数时候应该 IGNORE；只有话题和你有关、很有趣、或你确实能接上话时才 SPEAK。")
         try:
@@ -547,7 +567,13 @@ class LazyBot(discord.Client):
         if str(target.author.id) not in user_ids:
             user_ids.insert(0, str(target.author.id))
 
-        emoji_text, emap = await emoji.candidates(gid, int(general.get("emoji_candidates") or 0))
+        # 私聊没有自己的表情：设了来源服务器就用那个服务器的，否则用所有服务器的
+        emoji_gid, emoji_scope = gid, cfg.get("emoji_scope") or "guild"
+        if is_dm:
+            emoji_gid = (dm or {}).get("guild_id") or DM
+            if emoji_gid == DM:
+                emoji_scope = "all"
+        emoji_text, emap = await emoji.candidates(emoji_gid, emoji_scope, int(cfg.get("emoji_limit") or 0))
         sticker_text, smap = ("", {}) if is_dm else await emoji.sticker_candidates(gid)
 
         if is_dm:
@@ -566,6 +592,10 @@ class LazyBot(discord.Client):
 
         target_tag = "" if is_dm else await context.user_tag(gid, str(target.author.id))
         messages = await context.build_messages(rows, gid, cfg, general)
+        if not interject:
+            extra = await self.reply_images(target, rows, gid, cfg)
+            if extra:
+                context.append_parts(messages, extra)
         context.append_note(messages, context.request_note(general, target_tag, interject))
         async with channel.typing():
             text = await llm.call("chat", system, messages, guild_id=None if is_dm else gid,
@@ -573,6 +603,7 @@ class LazyBot(discord.Client):
                                   tool_mode=cfg.get("chat_tools") or "off",
                                   tool_rounds=cfg.get("chat_tool_rounds", 4))
         out = context.parse_output(text)
+        out["reply"] = emoji.to_discord(out["reply"], emap)
         sticker = None
         for code in out["stickers"][:1]:
             if code in smap:
@@ -581,6 +612,35 @@ class LazyBot(discord.Client):
             await self.send_text(channel, out["reply"], reply_to=target if as_reply else None, sticker=sticker)
         if out["reacts"]:
             await self.add_reactions(target, out["reacts"], emap, general)
+
+    async def reply_images(self, target: discord.Message, rows: list[dict], gid: str, cfg: dict) -> list[dict]:
+        """触发消息回复了别的消息时，把那条消息里的图片也给模型看。"""
+        limit = max(0, int(cfg.get("reply_image_limit") or 0))
+        ref = target.reference
+        if not limit or not ref or not ref.message_id:
+            return []
+        rid = str(ref.message_id)
+        msg = ref.resolved if isinstance(ref.resolved, discord.Message) else None
+        if msg is None:
+            try:
+                ch = target.channel if ref.channel_id in (None, target.channel.id) else self.get_channel(ref.channel_id)
+                if ch is not None:
+                    msg = await ch.fetch_message(ref.message_id)
+            except discord.HTTPException as e:
+                log.info("取不到被回复的消息 %s：%s", rid, e)
+        if msg is not None:
+            # 现取的消息附件链接是新签发的，比库里存的可靠
+            images = extract_images(msg)
+            info = {"author_id": str(msg.author.id), "is_self": bool(self.user and msg.author.id == self.user.id),
+                    "username": msg.author.name, "display": msg.author.display_name}
+        else:
+            row = await db.fetchone("SELECT * FROM messages WHERE id=?", (rid,))
+            if not row:
+                return []
+            images, info = json.loads(row["images"] or "[]"), row
+        # 已经作为普通图片放进上下文的就不重复给
+        skip = {i for mid, i in context.image_slots(rows, max(0, int(cfg.get("image_limit") or 0))) if mid == rid}
+        return await context.reply_image_parts(info, images, gid, limit, skip)
 
     async def send_text(self, channel, text: str, reply_to: discord.Message | None = None, sticker=None):
         chunks = split_text(text) or [""]
@@ -610,8 +670,10 @@ class LazyBot(discord.Client):
         for code in codes[:limit]:
             code = code.strip()
             target = None
-            if code in emap:
-                target = self.get_emoji(int(emap[code]["id"]))
+            row = emoji.lookup(code, emap)
+            if row:
+                target = self.get_emoji(int(row["id"])) or discord.PartialEmoji(
+                    name=row["name"], id=int(row["id"]), animated=bool(row["animated"]))
             elif re.fullmatch(r"<a?:\w+:\d+>", code):
                 target = discord.PartialEmoji.from_str(code)
             elif UNICODE_EMOJI_HINT.match(code):

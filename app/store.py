@@ -11,6 +11,7 @@ SCOPE_DEFAULTS: dict = {
     "context_mode": "count",      # count=按消息条数, tokens=按估算 token 数
     "context_size": 40,
     "image_limit": 2,             # 进入上下文的图片数量上限
+    "reply_image_limit": 4,       # 被回复的那条消息里最多看几张图片（不占 image_limit）
     "memory_enabled": True,       # 是否把记忆放进系统提示词
     "interject_enabled": False,   # 主动插话
     "interject_prob": 0.15,       # 每批新消息触发插话判断的概率
@@ -21,13 +22,16 @@ SCOPE_DEFAULTS: dict = {
     "chat_model": "",
     "chat_tools": "off",         # off=纯聊天; external=搜索服务; claude=Claude 原生搜索
     "chat_tool_rounds": 4,        # 最多执行几轮工具调用 / 原生搜索续轮
+    "emoji_scope": "guild",       # guild=只给本服务器的表情, all=bot 所在所有服务器的表情
+    "emoji_limit": 60,            # 最多给模型看多少个表情，0=不给
+    "emoji_images": True,         # 上下文里群友用的表情附上图片（不占 image_limit）
+    "emoji_image_limit": 60,      # 一次请求最多附几张表情图，0=不限
 }
 
 GENERAL_DEFAULTS: dict = {
     "timezone": "Asia/Shanghai",
     "debounce_seconds": 3.0,      # 防抖等待
     "respond_to_bots": False,     # 是否回应其他 bot
-    "emoji_candidates": 60,       # 提供给模型的候选表情数量
     "judge_context_lines": 15,    # 插话判断时给小模型看的最近消息条数
     "max_reactions": 2,
     "gap_minutes": 30,            # 相邻消息间隔超过多少分钟时标注时间间隔
@@ -61,6 +65,11 @@ async def set_scope(scope_type: str, scope_id: str, data: dict) -> None:
         if not 1 <= rounds <= 8:
             raise ValueError("工具调用轮数必须在 1 到 8 之间")
         clean["chat_tool_rounds"] = rounds
+    if "emoji_scope" in clean and clean["emoji_scope"] not in ("guild", "all"):
+        raise ValueError("表情范围无效")
+    for k in ("emoji_limit", "emoji_image_limit", "reply_image_limit", "image_limit"):
+        if k in clean:
+            clean[k] = max(0, int(clean[k] or 0))
     await db.execute(
         "INSERT INTO scope_config (scope_type, scope_id, data) VALUES (?, ?, ?) "
         "ON CONFLICT(scope_type, scope_id) DO UPDATE SET data=excluded.data",
