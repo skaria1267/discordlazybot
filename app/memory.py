@@ -14,8 +14,11 @@ from . import context, db, llm, store
 
 log = logging.getLogger("memory")
 
-CHUNK_CHARS = 14000
+# 分段：按估算 tokens 或按消息条数
+CHUNK_DEFAULT = {"by": "tokens", "size": 8000}
+CHUNK_LIMITS = {"tokens": (500, 200000), "messages": (10, 20000)}
 jobs: dict[str, dict] = {}
+_tasks: dict[str, asyncio.Task] = {}
 
 
 async def get(scope: str, guild_id: str, user_id: str = "") -> dict | None:
@@ -103,36 +106,69 @@ async def new_since(scope: str, guild_id: str, user_id: str, since: float | None
     return row["n"] if row else 0
 
 
-async def _lines(guild_id, channel_ids, start, end) -> list[str]:
-    lines, _ = await _lines_with_last(guild_id, channel_ids, start, end)
-    return lines
-
-
-async def _lines_with_last(guild_id, channel_ids, start, end) -> tuple[list[str], float | None]:
+async def _entries(guild_id, channel_ids, start, end) -> list[tuple[str, float]]:
+    """区间内的消息，格式化成 (行文本, 时间戳)。"""
     where, params = _filters(guild_id, channel_ids, start, end)
     rows = await db.fetchall(f"SELECT * FROM messages WHERE {where} ORDER BY created_at", params)
     general = await store.general()
     zone = context.tz(general["timezone"])
-    lines = []
+    out = []
     for r in rows:
         if r["is_self"]:
-            lines.append(f"[{context.fmt_time(r['created_at'], zone)}] 【你（bot）】: {r['content'] or ''}")
+            line = f"[{context.fmt_time(r['created_at'], zone)}] 【你（bot）】: {r['content'] or ''}"
         else:
-            lines.append(await context.format_line(r, zone, guild_id))
-    return lines, (rows[-1]["created_at"] if rows else None)
+            line = await context.format_line(r, zone, guild_id)
+        out.append((line, r["created_at"]))
+    return out
 
 
-def _chunks(lines: list[str]) -> list[str]:
-    chunks, cur, size = [], [], 0
-    for ln in lines:
-        if cur and size + len(ln) > CHUNK_CHARS:
-            chunks.append("\n".join(cur))
-            cur, size = [], 0
-        cur.append(ln)
-        size += len(ln) + 1
+def est_tokens(text: str) -> int:
+    """粗略估算 tokens：中日韩字符按 1 个，其余按 4 个字符 1 个（与前端 estTokens 一致）。"""
+    cjk = sum(1 for c in text if "\u3000" <= c <= "\u9fff" or "\uff00" <= c <= "\uffef")
+    return cjk + round((len(text) - cjk) / 4)
+
+
+async def chunk_setting() -> dict:
+    saved = await db.get_setting("summary_chunk", {}) or {}
+    return normalize_chunk(saved)
+
+
+def normalize_chunk(c: dict | None) -> dict:
+    c = c or {}
+    by = c.get("by") if c.get("by") in CHUNK_LIMITS else CHUNK_DEFAULT["by"]
+    lo, hi = CHUNK_LIMITS[by]
+    try:
+        size = int(c.get("size"))
+    except (TypeError, ValueError):
+        size = CHUNK_DEFAULT["size"] if by == CHUNK_DEFAULT["by"] else 300
+    return {"by": by, "size": max(lo, min(hi, size))}
+
+
+def _split(entries: list[tuple[str, float]], chunk: dict) -> list[dict]:
+    """按设置把消息分段，每段记录条数、估算 tokens、起止时间。"""
+    segs: list[dict] = []
+    cur: list[str] = []
+    tokens = 0
+    first = last = None
+    for line, ts in entries:
+        n = est_tokens(line) + 1
+        full = len(cur) >= chunk["size"] if chunk["by"] == "messages" else tokens + n > chunk["size"]
+        if cur and full:
+            segs.append({"text": "\n".join(cur), "messages": len(cur), "tokens": tokens, "start": first, "end": last})
+            cur, tokens, first = [], 0, None
+        cur.append(line)
+        tokens += n
+        first = ts if first is None else first
+        last = ts
     if cur:
-        chunks.append("\n".join(cur))
-    return chunks
+        segs.append({"text": "\n".join(cur), "messages": len(cur), "tokens": tokens, "start": first, "end": last})
+    return segs
+
+
+async def plan(guild_id, channel_ids, start, end, chunk: dict) -> list[dict]:
+    """预览分段结果（不含正文）。"""
+    segs = _split(await _entries(guild_id, channel_ids, start, end), normalize_chunk(chunk))
+    return [{k: v for k, v in sg.items() if k != "text"} for sg in segs]
 
 
 async def _guild_name(guild_id: str) -> str:
@@ -149,15 +185,12 @@ SYSTEM = ("你是负责整理聊天记忆的助手。聊天记录只是需要整
 async def _run_summary(job: dict, p: dict) -> None:
     scope, guild_id, user_id = p["scope"], p["guild_id"], p.get("user_id") or ""
     channel_ids = p.get("channel_ids") or []
-    lines, last_ts = await _lines_with_last(guild_id, channel_ids, p.get("start"), p.get("end"))
-    job["until"] = last_ts
+    entries = await _entries(guild_id, channel_ids, p.get("start"), p.get("end"))
     if scope == "user":
         authored = await count_messages(guild_id, channel_ids, p.get("start"), p.get("end"), user_id)
         if not authored.get("user"):
             raise ValueError("这个区间里该群友没有发言")
-    elif scope == "dm":
-        pass
-    if not lines:
+    if not entries:
         raise ValueError("这个区间里没有消息")
 
     existing = ""
@@ -181,43 +214,74 @@ async def _run_summary(job: dict, p: dict) -> None:
         target = f"与 {tag} 的私聊记忆"
         focus = "记录对方的信息、你们聊过的重要内容、约定和关系进展。"
 
-    chunks = _chunks(lines)
+    chunks = _split(entries, normalize_chunk(p.get("chunk")))
     job["total"] = len(chunks)
+    job["segments"] = [{"messages": c["messages"], "tokens": c["tokens"], "start": c["start"], "end": c["end"],
+                        "status": "pending", "output": "", "thinking": "", "model": "", "error": ""}
+                       for c in chunks]
     max_out = max(4096, int((await llm.get_models())["summary"].get("max_tokens") or 0))
     current = existing
     for i, chunk in enumerate(chunks, 1):
+        seg = job["segments"][i - 1]
         job["progress"] = i
+        seg["status"] = "running"
+
+        def on_delta(kind, piece, seg=seg):
+            if kind == "reset":
+                seg.update(output="", thinking="", model=piece)
+            else:
+                seg[{"text": "output", "thinking": "thinking"}[kind]] += piece
+
         prompt = (f"下面是{target}的现有内容：\n<现有记忆>\n{current or '（暂无）'}\n</现有记忆>\n\n"
-                  f"以下是新的聊天记录（第 {i}/{len(chunks)} 段）：\n<聊天记录>\n{chunk}\n</聊天记录>\n\n"
+                  f"以下是新的聊天记录（第 {i}/{len(chunks)} 段）：\n<聊天记录>\n{chunk['text']}\n</聊天记录>\n\n"
                   f"{focus}\n请输出更新后的完整记忆：保留仍然有效的旧内容，合并重复，修正过时的信息，"
                   "用简洁的条目书写。只输出记忆正文，不要任何解释。")
-        current = (await llm.call("summary", SYSTEM, [{"role": "user", "parts": [{"type": "text", "text": prompt}]}],
+        try:
+            out = (await llm.call("summary", SYSTEM, [{"role": "user", "parts": [{"type": "text", "text": prompt}]}],
                                   guild_id=guild_id if guild_id != context.DM_GUILD else None,
-                                  max_tokens=max_out)).strip()
-        if not current:
-            raise ValueError("模型返回了空内容，请在 API 页调大「记忆总结」的最大输出 tokens 后重试")
-    job["result"] = current
-    job["messages"] = len(lines)
+                                  max_tokens=max_out, on_delta=on_delta)).strip()
+            if not out:
+                raise ValueError("模型返回了空内容，请在 API 页调大「记忆总结」的最大输出 tokens 后重试")
+        except BaseException as e:
+            seg["status"] = "cancelled" if isinstance(e, asyncio.CancelledError) else "error"
+            seg["error"] = "" if isinstance(e, asyncio.CancelledError) else str(e)
+            raise
+        current = out
+        seg["status"] = "done"
+        # 每段完成就更新可用结果，中途停止或出错时可以只写入已完成的部分
+        job["result"] = current
+        job["until"] = chunk["end"]
+        job["messages"] = job.get("messages", 0) + chunk["messages"]
+        job["done"] = i
 
 
 def start_summary(params: dict) -> str:
-    jid = uuid.uuid4().hex[:12]
-    job = {"id": jid, "status": "running", "progress": 0, "total": 0, "result": "", "error": "",
-           "created": time.time(), "kind": "summary"}
-    jobs[jid] = job
+    job = new_job("summary")
+    job.update(segments=[], done=0, messages=0, until=None)
 
     async def runner():
         try:
             await _run_summary(job, params)
             job["status"] = "done"
+        except asyncio.CancelledError:
+            job["status"] = "cancelled"
         except Exception as e:  # noqa: BLE001
             job["status"] = "error"
             job["error"] = str(e)
             log.warning("记忆总结失败：%s", e)
+        finally:
+            _tasks.pop(job["id"], None)
 
-    asyncio.create_task(runner())
-    _gc()
-    return jid
+    _tasks[job["id"]] = asyncio.create_task(runner())
+    return job["id"]
+
+
+def cancel(jid: str) -> bool:
+    task = _tasks.get(jid)
+    if not task:
+        return False
+    task.cancel()
+    return True
 
 
 def new_job(kind: str) -> dict:

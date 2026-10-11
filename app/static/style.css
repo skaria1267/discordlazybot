@@ -331,6 +331,11 @@ pre.trace { background: var(--field); padding: 10px; border-radius: 6px; font: 1
 .turn.assistant { border-left-color: var(--tape-pink); }
 .turn b { font-weight: normal; color: var(--ink-faint); font-size: 12px; display: block; }
 
+/* 总结流式预览 */
+.stream { font-size: 14px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--field); border-radius: 6px; padding: 10px 12px; min-height: 30vh; max-height: 50vh; overflow: auto; }
+.think .stream { min-height: 0; max-height: 25vh; color: var(--ink-soft); margin-top: 6px; }
+.think { margin-bottom: 8px; }
+
 /* 进度 */
 .progress { height: 8px; background: var(--field); border-radius: 4px; overflow: hidden; }
 .progress i { display: block; height: 100%; width: 0; background: var(--tape-green); transition: width .3s; }

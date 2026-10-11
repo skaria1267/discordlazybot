@@ -262,11 +262,23 @@ async def import_guild_status(gid: str):
 
 
 @app.get("/api/jobs/{jid}", dependencies=A)
-async def job(jid: str):
+async def job(jid: str, seg: int | None = None):
     j = memory.jobs.get(jid)
     if not j:
         raise HTTPException(404, "任务不存在（可能服务已重启）")
-    return j
+    if not j.get("segments"):
+        return j
+    # 总结任务每段都带完整输出，轮询时只返回正在查看的那一段，其余段只给状态
+    show = seg if seg is not None else max(0, j["progress"] - 1)
+    return {**j, "segments": [s if i == show else {**s, "output": "", "thinking": ""}
+                              for i, s in enumerate(j["segments"])]}
+
+
+@app.post("/api/jobs/{jid}/cancel", dependencies=A)
+async def job_cancel(jid: str):
+    if jid not in memory.jobs:
+        raise HTTPException(404, "任务不存在（可能服务已重启）")
+    return {"ok": memory.cancel(jid)}
 
 
 # ---------- 分层配置 ----------
@@ -421,7 +433,8 @@ async def memory_get(scope: str, guild_id: str, user_id: str = ""):
     tag = await context.tag_with_history(guild_id, user_id) if user_id else ""
     since = row["summarized_until"] if row else None
     return {"memory": row, "tag": tag, "summarized_until": since,
-            "new_since": await memory.new_since(scope, guild_id, user_id, since)}
+            "new_since": await memory.new_since(scope, guild_id, user_id, since),
+            "chunk": await memory.chunk_setting()}
 
 
 @app.post("/api/memory/save", dependencies=A)
@@ -455,15 +468,20 @@ def _range(body: dict):
 @app.post("/api/memory/count", dependencies=A)
 async def memory_count(body: dict = Body(...)):
     gid, chs, start, end = _range(body)
-    return await memory.count_messages(gid, chs, start, end, body.get("user_id") or None)
+    out = await memory.count_messages(gid, chs, start, end, body.get("user_id") or None)
+    if body.get("chunk"):
+        out["segments"] = await memory.plan(gid, chs, start, end, body["chunk"])
+    return out
 
 
 @app.post("/api/memory/summarize", dependencies=A)
 async def memory_summarize(body: dict = Body(...)):
     gid, chs, start, end = _range(body)
+    chunk = memory.normalize_chunk(body.get("chunk"))
+    await db.set_setting("summary_chunk", chunk)
     jid = memory.start_summary({"scope": body["scope"], "guild_id": gid, "user_id": body.get("user_id") or "",
                                 "channel_ids": chs, "start": start, "end": end,
-                                "mode": body.get("mode") or "merge"})
+                                "mode": body.get("mode") or "merge", "chunk": chunk})
     return {"job_id": jid}
 
 

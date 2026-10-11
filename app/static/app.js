@@ -27,6 +27,10 @@ function ago(ts) {
   if (s < 86400 * 30) return `${Math.floor(s / 86400)} 天前`;
   return fmtTime(ts);
 }
+function elapsed(ts) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
 function duration(ts) {
   if (!ts) return '';
   const m = Math.floor((Date.now() / 1000 - ts) / 60);
@@ -717,10 +721,14 @@ function openSummarize(scope, gid, uid, info, title, onDone) {
   const g = state.guilds.find((x) => x.id === gid);
   const now = Date.now() / 1000;
   const since = info.summarized_until;
-  const st = { range: since ? 'since' : 'all', channels: [], mode: 'merge', start: null, end: null };
+  const st = { range: since ? 'since' : 'all', channels: [], mode: 'merge', start: null, end: null, chunk: { ...(info.chunk || { by: 'tokens', size: 8000 }) } };
   const body = h('<div></div>');
   const foot = h(`<button class="btn ink">${icon('spark')}开始总结</button>`);
-  const sheet = openSheet({ title: `总结${title}`, body, foot: [foot], beforeClose: () => !st.running || confirm('总结还在进行，关掉后结果会丢失，确定吗？') });
+  const sheet = openSheet({
+    title: `总结${title}`, body, foot: [foot], wide: true,
+    beforeClose: () => !st.running || confirm('总结还在进行，关掉会停止总结，已完成的结果也会丢失，确定吗？'),
+    onClose: () => { if (st.running && st.job) api(`/api/jobs/${st.job}/cancel`, {}).catch(() => {}); st.running = false; },
+  });
 
   const ranges = [[since ? 'since' : 'all', since ? '上次总结以后' : '全部消息'], ['day', '最近 24 小时'], ['week', '最近 7 天'], ['custom', '自定义']];
   const calc = () => {
@@ -730,7 +738,7 @@ function openSummarize(scope, gid, uid, info, title, onDone) {
     if (st.range === 'custom') return [st.start, st.end];
     return [null, null];
   };
-  const payload = () => { const [start, end] = calc(); return { scope, guild_id: gid, user_id: uid, channel_ids: st.channels, start, end, mode: st.mode }; };
+  const payload = () => { const [start, end] = calc(); return { scope, guild_id: gid, user_id: uid, channel_ids: st.channels, start, end, mode: st.mode, chunk: st.chunk }; };
 
   function step1() {
     body.innerHTML = '';
@@ -769,6 +777,14 @@ function openSummarize(scope, gid, uid, info, title, onDone) {
       });
       body.append(field('哪些频道', chips));
     }
+    const CHUNK_DEF = { tokens: 8000, messages: 300 };
+    const sizeIn = numberInput(st.chunk.size, (v) => { st.chunk.size = v; count(); }, { min: st.chunk.by === 'tokens' ? 500 : 10, step: st.chunk.by === 'tokens' ? 500 : 10 });
+    const chunkRow = h('<div class="row"><div class="grow"></div><div class="grow"></div></div>');
+    chunkRow.children[0].append(seg([['tokens', '按 tokens'], ['messages', '按消息条数']], st.chunk.by, (v) => { st.chunk = { by: v, size: CHUNK_DEF[v] }; step1(); }));
+    chunkRow.children[1].append(sizeIn);
+    body.append(field('分段发送', chunkRow, st.chunk.by === 'tokens'
+      ? '每段聊天记录大约多少 tokens（估算值），越小每次请求越快、越不容易超时，但段数更多'
+      : '每段放多少条消息，越少每次请求越快、越不容易超时，但段数更多'));
     body.append(field('怎么写进去', seg([['merge', '合并到现有记忆'], ['replace', '重新写一份']], st.mode, (v) => { st.mode = v; }), st.mode === 'merge' ? '保留仍然有效的旧内容，补充新信息' : '忽略现有记忆，只根据这段消息重写'));
     body.append(h('<p class="hint cnt">正在统计…</p>'));
     count();
@@ -780,7 +796,10 @@ function openSummarize(scope, gid, uid, info, title, onDone) {
       try {
         const r = await api('/api/memory/count', payload());
         const el = $('.cnt', body);
-        if (el) el.innerHTML = `将读取 <span class="mark">${r.total}</span> 条消息${r.user !== undefined ? `，其中 TA 说了 ${r.user} 条` : ''}。`
+        const segs = r.segments || [];
+        const maxTok = Math.max(0, ...segs.map((x) => x.tokens));
+        if (el) el.innerHTML = `将读取 <span class="mark">${r.total}</span> 条消息${r.user !== undefined ? `，其中 TA 说了 ${r.user} 条` : ''}`
+          + (segs.length ? `，分 <span class="mark">${segs.length}</span> 段依次发送，最大一段约 ${fmtNum(maxTok)} tokens` : '') + '。'
           + (gid !== 'dm' ? `<br>只能总结 bot 已经存下来的消息，更早的聊天记录要先到「频道」页导入。` : '');
         foot.disabled = !r.total;
       } catch (e) { const el = $('.cnt', body); if (el) el.textContent = e.message; }
@@ -789,33 +808,90 @@ function openSummarize(scope, gid, uid, info, title, onDone) {
 
   foot.onclick = async () => {
     st.running = true;
-    foot.disabled = true;
-    body.innerHTML = `<div style="padding:20px 0"><p style="margin:0 0 10px">正在读聊天记录…</p><div class="progress"><i></i></div><p class="hint step"></p></div>`;
+    st.view = null; // 正在查看的段，null 表示跟随当前段
+    body.innerHTML = `<div class="sum-run">
+      <div class="row" style="align-items:center;gap:10px"><div class="grow"><div class="progress"><i></i></div></div><span class="small muted step">准备中…</span></div>
+      <div class="chips segs" style="margin:10px 0"></div>
+      <p class="small muted seginfo" style="margin:0 0 6px"></p>
+      <details class="think" hidden><summary>思考过程</summary><div class="stream small"></div></details>
+      <div class="stream out">正在读聊天记录…</div></div>`;
+    const stop = h(`<button class="btn ghost">停止</button>`);
+    sheet.foot.innerHTML = '';
+    sheet.foot.append(stop);
+    const outEl = $('.out', body);
+    const thinkEl = $('.think', body);
+    let j;
+    stop.onclick = async () => { stop.disabled = true; stop.textContent = '正在停止…'; await api(`/api/jobs/${st.job}/cancel`, {}).catch(() => {}); };
+    const draw = () => {
+      const segs = j.segments || [];
+      const cur = st.view ?? Math.max(0, j.progress - 1);
+      const done = j.done || 0;
+      $('.progress i', body).style.width = `${segs.length ? Math.round((done / segs.length) * 100) : 0}%`;
+      $('.step', body).textContent = segs.length ? `第 ${j.progress} / ${segs.length} 段 · ${elapsed(j.created)}` : '准备中…';
+      const chips = $('.segs', body);
+      chips.innerHTML = '';
+      segs.forEach((x, i) => {
+        const mark = { done: '✓', running: '…', error: '✕', cancelled: '–' }[x.status] || '';
+        const c = h(`<button class="chip ${i === cur ? 'on' : ''}">${i + 1}${mark ? ` ${mark}` : ''}</button>`);
+        c.onclick = () => { st.view = i === Math.max(0, j.progress - 1) ? null : i; poll(); };
+        chips.append(c);
+      });
+      const x = segs[cur];
+      if (!x) return;
+      $('.seginfo', body).textContent = `第 ${cur + 1} 段 · ${x.messages} 条消息 · 约 ${fmtNum(x.tokens)} tokens · ${fmtTime(x.start)} – ${fmtTime(x.end)}${x.model ? ` · ${x.model}` : ''}`;
+      thinkEl.hidden = !x.thinking;
+      const tEl = $('.stream', thinkEl);
+      if (tEl.textContent !== x.thinking) { tEl.textContent = x.thinking; tEl.scrollTop = tEl.scrollHeight; }
+      const text = x.output || { pending: '还没开始', running: x.thinking ? '思考中…' : '等待模型输出…', cancelled: '已停止', error: x.error || '出错了' }[x.status] || '';
+      if (outEl.textContent !== text) {
+        const atBottom = outEl.scrollTop + outEl.clientHeight >= outEl.scrollHeight - 30;
+        outEl.textContent = text;
+        if (atBottom || st.view === null) outEl.scrollTop = outEl.scrollHeight;
+      }
+    };
+    const poll = async () => {
+      if (!st.job) return;
+      j = await api(`/api/jobs/${st.job}${st.view === null ? '' : `?seg=${st.view}`}`);
+      draw();
+    };
     try {
       const { job_id } = await api('/api/memory/summarize', payload());
-      let j;
+      st.job = job_id;
       for (;;) {
-        await sleep(1500);
-        j = await api(`/api/jobs/${job_id}`);
-        if (j.total) { $('.progress i', body).style.width = `${Math.round(((j.progress - 0.5) / j.total) * 100)}%`; $('.step', body).textContent = `第 ${j.progress} / ${j.total} 段`; }
-        if (j.status === 'done') break;
-        if (j.status === 'error') throw new Error(j.error || '总结失败');
+        await poll();
+        if (j.status !== 'running') break;
+        if (!st.running) return; // 弹窗已关闭
+        await sleep(700);
       }
       st.running = false;
-      step3(j);
+      if (j.status === 'done') { step3(j); return; }
+      const msg = j.status === 'cancelled' ? '已停止' : `总结失败：${j.error || '未知错误'}`;
+      stop.remove();
+      if (j.done) {
+        body.prepend(h(`<p class="hint" style="margin:0 0 10px">${esc(msg)}。前 ${j.done} 段已经完成（${j.messages} 条消息，到 ${fmtTime(j.until)}），可以先写入这部分，下次从「上次总结以后」接着总结。</p>`));
+        const keep = h(`<button class="btn ink">${icon('check')}用前 ${j.done} 段的结果</button>`);
+        keep.onclick = () => step3(j);
+        sheet.foot.append(retryBtn(), keep);
+      } else {
+        body.prepend(h(`<p class="hint" style="margin:0 0 10px">${esc(msg)}</p>`));
+        sheet.foot.append(retryBtn());
+      }
     } catch (e) {
       st.running = false;
       body.innerHTML = emptyHtml('log', esc(e.message));
-      foot.disabled = false;
-      foot.innerHTML = `${icon('refresh')}重新设置`;
-      foot.onclick = () => { foot.innerHTML = `${icon('spark')}开始总结`; foot.onclick = startHandler; step1(); };
+      sheet.foot.innerHTML = '';
+      sheet.foot.append(retryBtn());
     }
   };
-  const startHandler = foot.onclick;
+  const retryBtn = () => {
+    const b = h(`<button class="btn">${icon('refresh')}重新设置</button>`);
+    b.onclick = () => { sheet.foot.innerHTML = ''; sheet.foot.append(foot); foot.disabled = false; step1(); };
+    return b;
+  };
 
   function step3(job) {
     const old = info.memory ? info.memory.content : '';
-    body.innerHTML = `<p class="small muted" style="margin-top:0">读了 ${job.messages} 条消息。确认无误后再写入，写入前可以修改。</p>`;
+    body.innerHTML = `<p class="small muted" style="margin-top:0">读了 ${job.messages} 条消息${job.status === 'done' ? '' : `（前 ${job.done} 段，到 ${fmtTime(job.until)}）`}。确认无误后再写入，写入前可以修改。</p>`;
     const view = h('<div></div>');
     const ta = h(`<textarea class="paper fill">${esc(job.result)}</textarea>`);
     const show = (v) => { view.innerHTML = ''; if (v === 'edit') view.append(ta); else view.innerHTML = `<div class="diff">${diffHtml(old, ta.value)}</div>`; };

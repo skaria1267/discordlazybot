@@ -5,6 +5,7 @@
                                              {"type": "image", "media_type": "image/png", "data": "<base64>"}]}
 """
 import copy
+import json
 import logging
 import time
 import uuid
@@ -164,10 +165,8 @@ def _url(base: str, fmt: str) -> str:
 
 # ---------- 调用 ----------
 
-async def _request(provider: dict, model: str, system: str, messages: list[dict],
-                   max_tokens: int, temperature: float, tool_mode: str = "off",
-                   tool_rounds: int = 4, search_cfg: dict | None = None,
-                   on_usage=None) -> tuple[str, dict]:
+def _build(provider: dict, model: str, system: str, messages: list[dict],
+           max_tokens: int, temperature: float) -> tuple[str, dict, dict]:
     fmt = provider.get("format", "openai")
     url = _url(provider.get("base_url", ""), fmt)
     key = provider.get("api_key", "")
@@ -183,6 +182,15 @@ async def _request(provider: dict, model: str, system: str, messages: list[dict]
         body = {"model": model, "max_tokens": max_tokens, "temperature": temperature,
                 "messages": _to_openai(system, msgs)}
         headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
+    return url, body, headers
+
+
+async def _request(provider: dict, model: str, system: str, messages: list[dict],
+                   max_tokens: int, temperature: float, tool_mode: str = "off",
+                   tool_rounds: int = 4, search_cfg: dict | None = None,
+                   on_usage=None) -> tuple[str, dict]:
+    fmt = provider.get("format", "openai")
+    url, body, headers = _build(provider, model, system, messages, max_tokens, temperature)
 
     try:
         definitions = tools.definitions(tool_mode, fmt)
@@ -298,16 +306,9 @@ async def _post(url: str, body: dict, headers: dict) -> dict:
 
 
 def _parse_response(data: dict, fmt: str, model: str) -> tuple[str, dict, str]:
-
-    usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     if fmt == "claude":
         text = "".join(c.get("text", "") for c in data.get("content", []) if c.get("type") == "text")
         stop = data.get("stop_reason") or ""
-        u = data.get("usage") or {}
-        usage["input"] = int(u.get("input_tokens") or 0)
-        usage["output"] = int(u.get("output_tokens") or 0)
-        usage["cache_read"] = int(u.get("cache_read_input_tokens") or 0)
-        usage["cache_write"] = int(u.get("cache_creation_input_tokens") or 0)
     else:
         choices = data.get("choices") or []
         if not choices:
@@ -317,19 +318,107 @@ def _parse_response(data: dict, fmt: str, model: str) -> tuple[str, dict, str]:
             content = "".join(c.get("text", "") for c in content if isinstance(c, dict))
         text = content
         stop = choices[0].get("finish_reason") or ""
-        u = data.get("usage") or {}
+    usage = _usage(fmt, data.get("usage") or {})
+    _check_stop(model, text, stop)
+    return text, usage, stop
+
+
+def _usage(fmt: str, u: dict) -> dict:
+    usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    if fmt == "claude":
+        usage["input"] = int(u.get("input_tokens") or 0)
+        usage["output"] = int(u.get("output_tokens") or 0)
+        usage["cache_read"] = int(u.get("cache_read_input_tokens") or 0)
+        usage["cache_write"] = int(u.get("cache_creation_input_tokens") or 0)
+    else:
         details = u.get("prompt_tokens_details") or {}
         usage["cache_read"] = int(details.get("cached_tokens") or u.get("cache_read_input_tokens") or 0)
         usage["cache_write"] = int(u.get("cache_creation_input_tokens") or 0)
         # OpenAI 格式的 prompt_tokens 已包含缓存命中部分，扣掉以免重复计费
         usage["input"] = max(0, int(u.get("prompt_tokens") or 0) - usage["cache_read"])
         usage["output"] = int(u.get("completion_tokens") or 0)
+    return usage
+
+
+def _check_stop(model: str, text: str, stop: str) -> None:
     if stop in ("max_tokens", "length"):
         log.warning("模型 %s 的输出因达到最大 tokens 被截断%s，请在 API 页调大「最大输出 tokens」"
                     "（开启思考时思考内容也占用这个额度）", model, "，正文为空" if not text.strip() else "")
     elif not text.strip() and stop not in ("tool_use", "tool_calls", "pause_turn"):
         log.warning("模型 %s 返回了空内容（stop_reason=%s）", model, stop or "?")
-    return text, usage, stop
+
+
+async def _stream(provider: dict, model: str, system: str, messages: list[dict],
+                  max_tokens: int, temperature: float, on_delta) -> tuple[str, dict]:
+    """流式请求（不带工具）。每收到一段正文调用 on_delta("text", 片段)，思考内容为 on_delta("thinking", 片段)。"""
+    fmt = provider.get("format", "openai")
+    url, body, headers = _build(provider, model, system, messages, max_tokens, temperature)
+    body["stream"] = True
+    if fmt != "claude":
+        body["stream_options"] = {"include_usage": True}
+    text, stop = [], ""
+    usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    async with client().stream("POST", url, json=body, headers=headers) as resp:
+        if resp.status_code >= 400:
+            raw = (await resp.aread()).decode("utf-8", "replace")
+            raise LLMError(f"HTTP {resp.status_code}: {raw[:500]}")
+        if "event-stream" not in resp.headers.get("content-type", ""):
+            # 供应商不支持流式时会直接返回完整 JSON
+            raw = await resp.aread()
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                raise LLMError(f"返回的不是 JSON: {raw[:300].decode('utf-8', 'replace')}")
+            if not isinstance(data, dict):
+                raise LLMError("模型响应必须是 JSON 对象")
+            full, usage, _ = _parse_response(data, fmt, model)
+            on_delta("text", full)
+            return full, usage
+        async for line in resp.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                ev = json.loads(payload)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            if ev.get("error"):
+                raise LLMError(f"流式响应报错: {str(ev['error'])[:500]}")
+            if fmt == "claude":
+                kind = ev.get("type")
+                if kind == "message_start":
+                    u = _usage(fmt, (ev.get("message") or {}).get("usage") or {})
+                    for k in ("input", "cache_read", "cache_write"):
+                        usage[k] = u[k]
+                elif kind == "content_block_delta":
+                    d = ev.get("delta") or {}
+                    if d.get("type") == "text_delta" and d.get("text"):
+                        text.append(d["text"])
+                        on_delta("text", d["text"])
+                    elif d.get("type") == "thinking_delta" and d.get("thinking"):
+                        on_delta("thinking", d["thinking"])
+                elif kind == "message_delta":
+                    stop = (ev.get("delta") or {}).get("stop_reason") or stop
+                    usage["output"] = int((ev.get("usage") or {}).get("output_tokens") or usage["output"])
+            else:
+                if ev.get("usage"):
+                    usage = _usage(fmt, ev["usage"])
+                for choice in ev.get("choices") or []:
+                    d = choice.get("delta") or {}
+                    thinking = d.get("reasoning_content") or d.get("reasoning")
+                    if isinstance(thinking, str) and thinking:
+                        on_delta("thinking", thinking)
+                    if isinstance(d.get("content"), str) and d["content"]:
+                        text.append(d["content"])
+                        on_delta("text", d["content"])
+                    stop = choice.get("finish_reason") or stop
+    full = "".join(text)
+    _check_stop(model, full, stop)
+    return full, usage
 
 
 async def _record(guild_id, provider, model, purpose, usage, ok):
@@ -346,8 +435,12 @@ async def _record(guild_id, provider, model, purpose, usage, ok):
 
 async def call(purpose: str, system: str, messages: list[dict], guild_id: str | None = None,
                provider_id: str = "", model: str = "", max_tokens: int | None = None,
-               tool_mode: str = "off", tool_rounds: int = 4) -> str:
-    """按用途调用模型。provider_id/model 可覆盖用途配置（例如分层配置中的聊天模型）。"""
+               tool_mode: str = "off", tool_rounds: int = 4, on_delta=None) -> str:
+    """按用途调用模型。provider_id/model 可覆盖用途配置（例如分层配置中的聊天模型）。
+
+    传入 on_delta 时以流式请求（不带工具）：每次尝试前回调 on_delta("reset", 模型名)，
+    之后逐段回调 on_delta("text" | "thinking", 片段)。
+    """
     models = await get_models()
     providers = {p["id"]: p for p in await get_providers(with_keys=True)}
     tool_mode = tool_mode if purpose == "chat" else "off"
@@ -373,10 +466,15 @@ async def call(purpose: str, system: str, messages: list[dict], guild_id: str | 
             async def record_round(usage):
                 await _record(guild_id, prov["name"], cfg["model"], purpose, usage, True)
 
+            out_tokens = int(max_tokens or cfg.get("max_tokens") or 1024)
+            temperature = float(cfg.get("temperature") if cfg.get("temperature") is not None else 0.9)
+            if on_delta and tool_mode == "off":
+                on_delta("reset", cfg["model"])
+                text, usage = await _stream(prov, cfg["model"], system, messages, out_tokens, temperature, on_delta)
+                await record_round(usage)
+                return text
             text, usage = await _request(
-                prov, cfg["model"], system, messages,
-                int(max_tokens or cfg.get("max_tokens") or 1024),
-                float(cfg.get("temperature") if cfg.get("temperature") is not None else 0.9),
+                prov, cfg["model"], system, messages, out_tokens, temperature,
                 tool_mode=tool_mode, tool_rounds=tool_rounds, search_cfg=search_cfg,
                 on_usage=record_round,
             )
